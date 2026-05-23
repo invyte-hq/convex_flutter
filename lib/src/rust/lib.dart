@@ -8,7 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'lib.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `connected_client`, `decode_jwt_expiry`, `diagnose_connectivity`, `handle_direct_function_result`, `init_logging`, `internal_action`, `internal_mutation`, `internal_set_auth`, `internal_subscribe`, `new`, `new`, `parse_json_args`
+// These functions are ignored because they are not marked as `pub`: `connected_client`, `decode_jwt_expiry`, `handle_direct_function_result`, `init_logging`, `internal_action`, `internal_mutation`, `internal_set_auth`, `internal_subscribe`, `new`, `new`, `parse_json_args`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `JwtClaims`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `fmt`, `fmt`, `from`, `from`
 
@@ -49,6 +49,21 @@ abstract class MobileConvexClient implements RustOpaqueInterface {
     required String name,
     required Map<String, String> args,
   });
+
+  /// Drops the underlying Convex client so the next operation builds a fresh
+  /// WebSocket connection.
+  ///
+  /// This is the foundation for "reconnect on app resume" — iOS suspends the
+  /// process while backgrounded, leaving the WS in a zombie state that the
+  /// Rust SDK's 5s ping / 30s inactivity heartbeat takes up to ~35s to detect
+  /// and recover from. Calling this forces immediate recovery.
+  ///
+  /// Callers (Dart side) are responsible for re-establishing auth via
+  /// [`set_auth_with_refresh`] and re-firing any active subscriptions after
+  /// invoking this method, since the previous [`AuthHandle`] and
+  /// [`SubscriptionHandle`] values point at the dropped client and will no
+  /// longer receive updates.
+  Future<void> forceReconnect();
 
   /// Executes a mutation on the Convex backend.
   Future<String> mutation({
