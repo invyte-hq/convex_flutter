@@ -9,7 +9,6 @@ use std::{
 };
 
 use android_logger::Config;
-use async_once_cell::OnceCell;
 use convex::{
     ConvexClient,
     ConvexClientBuilder,
@@ -213,10 +212,13 @@ impl QuerySubscriber for CallbackSubscriberDartFn {
 /// Main Convex client struct, opaque to Dart, managing connections and operations.
 #[frb(opaque)]
 pub struct MobileConvexClient {
-    deployment_url: String,         // URL of the Convex deployment
-    client_id: String,              // Client ID for authentication
-    client: OnceCell<ConvexClient>, // Lazy-initialized Convex client
-    rt: tokio::runtime::Runtime,    // Tokio runtime for async operations
+    deployment_url: String,      // URL of the Convex deployment
+    client_id: String,           // Client ID for authentication
+    // Swappable inner client so we can force a full reconnect (drop + re-init)
+    // on app resume after iOS suspension. tokio::sync::Mutex because init is
+    // async (ConvexClientBuilder::build).
+    client: tokio::sync::Mutex<Option<ConvexClient>>,
+    rt: tokio::runtime::Runtime, // Tokio runtime for async operations
     // Channel sender for WebSocket state change notifications
     state_change_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ConvexWebSocketState>>>>,
 }
@@ -233,7 +235,7 @@ impl MobileConvexClient {
         MobileConvexClient {
             deployment_url,
             client_id,
-            client: OnceCell::new(),
+            client: tokio::sync::Mutex::new(None),
             rt,
             state_change_sender: Arc::new(Mutex::new(None)),
         }
@@ -289,33 +291,61 @@ impl MobileConvexClient {
     }
 
     /// Retrieves or initializes a connected Convex client.
+    ///
+    /// Holds the inner client behind a `Mutex<Option<…>>` so [`force_reconnect`]
+    /// can drop the existing instance and have the next call build a fresh
+    /// connection.
     async fn connected_client(&self) -> anyhow::Result<ConvexClient> {
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
+        }
+
         let url = self.deployment_url.clone();
         let state_sender = self.state_change_sender.lock().clone();
+        let client_id = self.client_id.to_owned();
 
-        self.client
-            .get_or_try_init(async {
-                let client_id = self.client_id.to_owned();
+        debug!("Building ConvexClient for {}", url);
+        let mut builder = ConvexClientBuilder::new(url.as_str()).with_client_id(&client_id);
 
-                debug!("Building ConvexClient for {}", url);
-                let mut builder = ConvexClientBuilder::new(url.as_str())
-                    .with_client_id(&client_id);
+        if let Some(sender) = state_sender {
+            builder = builder.with_on_state_change(sender);
+        } else {
+            error!("No state_change sender — state changes will not be emitted");
+        }
 
-                if let Some(sender) = state_sender {
-                    builder = builder.with_on_state_change(sender);
-                } else {
-                    error!("No state_change sender — state changes will not be emitted");
-                }
+        match builder.build().await {
+            Ok(client) => {
+                debug!("ConvexClient built successfully");
+                *guard = Some(client.clone());
+                Ok(client)
+            }
+            Err(e) => {
+                error!("Failed to build ConvexClient: {:?}", e);
+                Err(e)
+            }
+        }
+    }
 
-                let result = builder.build().await;
-                match &result {
-                    Ok(_) => debug!("ConvexClient built successfully"),
-                    Err(e) => error!("Failed to build ConvexClient: {:?}", e),
-                }
-                result
-            })
-            .await
-            .map(|client_ref| client_ref.clone())
+    /// Drops the underlying Convex client so the next operation builds a fresh
+    /// WebSocket connection.
+    ///
+    /// This is the foundation for "reconnect on app resume" — iOS suspends the
+    /// process while backgrounded, leaving the WS in a zombie state that the
+    /// Rust SDK's 5s ping / 30s inactivity heartbeat takes up to ~35s to detect
+    /// and recover from. Calling this forces immediate recovery.
+    ///
+    /// Callers (Dart side) are responsible for re-establishing auth via
+    /// [`set_auth_with_refresh`] and re-firing any active subscriptions after
+    /// invoking this method, since the previous [`AuthHandle`] and
+    /// [`SubscriptionHandle`] values point at the dropped client and will no
+    /// longer receive updates.
+    #[frb]
+    pub async fn force_reconnect(&self) -> Result<(), ClientError> {
+        debug!("force_reconnect: dropping inner ConvexClient");
+        let mut guard = self.client.lock().await;
+        *guard = None;
+        Ok(())
     }
 
     /// Executes a query on the Convex backend.

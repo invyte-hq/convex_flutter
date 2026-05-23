@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1095084362;
+  int get rustContentHash => -392724412;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -105,6 +105,10 @@ abstract class RustLibApi extends BaseApi {
     required MobileConvexClient that,
     required String name,
     required Map<String, String> args,
+  });
+
+  Future<void> crateMobileConvexClientForceReconnect({
+    required MobileConvexClient that,
   });
 
   Future<String> crateMobileConvexClientMutation({
@@ -456,6 +460,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<void> crateMobileConvexClientForceReconnect({
+    required MobileConvexClient that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMobileConvexClient(
+            that,
+            serializer,
+          );
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_client_error,
+        ),
+        constMeta: kCrateMobileConvexClientForceReconnectConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateMobileConvexClientForceReconnectConstMeta =>
+      const TaskConstMeta(
+        debugName: "MobileConvexClient_force_reconnect",
+        argNames: ["that"],
+      );
+
+  @override
   Future<String> crateMobileConvexClientMutation({
     required MobileConvexClient that,
     required String name,
@@ -474,7 +514,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -508,7 +548,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(deploymentUrl, serializer);
           sse_encode_String(clientId, serializer);
           sse_encode_bool(verboseLogging, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 9)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
         },
         codec: SseCodec(
           decodeSuccessData:
@@ -547,7 +587,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 11,
             port: port_,
           );
         },
@@ -587,7 +627,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 12,
             port: port_,
           );
         },
@@ -625,7 +665,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 13,
             port: port_,
           );
         },
@@ -671,7 +711,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 13,
+            funcId: 14,
             port: port_,
           );
         },
@@ -722,7 +762,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 15,
             port: port_,
           );
         },
@@ -754,7 +794,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 16)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -2137,6 +2177,22 @@ class MobileConvexClientImpl extends RustOpaque implements MobileConvexClient {
     name: name,
     args: args,
   );
+
+  /// Drops the underlying Convex client so the next operation builds a fresh
+  /// WebSocket connection.
+  ///
+  /// This is the foundation for "reconnect on app resume" — iOS suspends the
+  /// process while backgrounded, leaving the WS in a zombie state that the
+  /// Rust SDK's 5s ping / 30s inactivity heartbeat takes up to ~35s to detect
+  /// and recover from. Calling this forces immediate recovery.
+  ///
+  /// Callers (Dart side) are responsible for re-establishing auth via
+  /// [`set_auth_with_refresh`] and re-firing any active subscriptions after
+  /// invoking this method, since the previous [`AuthHandle`] and
+  /// [`SubscriptionHandle`] values point at the dropped client and will no
+  /// longer receive updates.
+  Future<void> forceReconnect() =>
+      RustLib.instance.api.crateMobileConvexClientForceReconnect(that: this);
 
   /// Executes a mutation on the Convex backend.
   Future<String> mutation({
