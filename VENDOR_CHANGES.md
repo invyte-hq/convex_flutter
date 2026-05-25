@@ -174,3 +174,28 @@ straightforward protocol-correctness fixes:
 `_authRefreshRequested` stream for server-initiated AuthErrors (decoupled
 from the public `_authStateController` so programmatic state changes
 don't trigger spurious refreshes).
+
+### Buffer Subscribe messages during initial auth setup (both transports)
+
+`setAuthWithRefresh` opens a `Completer<void>? _authInFlight` on entry and
+completes it once the first `setAuth(token)` has been pushed to the WS.
+`subscribe` awaits this completer before issuing its `ModifyQuerySet`
+(web) / `_rustClient.subscribe` (native) call.
+
+The race this fixes: callers commonly start subscribing the moment Clerk
+(or another external auth source) reports signed-in, which kicks off
+`setAuthWithRefresh` in parallel. Without the gate, Subscribe messages
+reach the server before the `Authenticate` does, and the server runs
+auth-required queries unauthenticated — yielding `NOT_AUTHENTICATED`
+errors that are only papered over by the resubscribe-after-auth path.
+
+The gate has zero cost outside of initial auth (`_authInFlight` is `null`,
+so `await null?.future` is a no-op). It does **not** fire on subsequent
+refresh-loop rotations — the old token remains valid until the new one
+lands, so subscribes never see an unauthenticated WS during a refresh.
+Public-query subscribes during initial auth pay one extra token-roundtrip
+of latency, which is invisible to users and only happens once per
+sign-in.
+
+`finally` guarantees the completer resolves even if `tokenFetcher` throws
+or returns `null` (sign-out path), so subscribes never hang.

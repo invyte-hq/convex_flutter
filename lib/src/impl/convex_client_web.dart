@@ -26,6 +26,10 @@
 // Auth + observability:
 //   - setAuthWithRefresh: JWT-aware refresh loop (decode exp, schedule refresh
 //     ~60s before expiry); onAuthChange receives the current token
+//   - setAuthWithRefresh + subscribe: _authInFlight Completer buffers Subscribe
+//     messages during the initial auth roundtrip so Authenticate reaches the
+//     server first (no NOT_AUTHENTICATED warnings on auth-required queries
+//     issued at sign-in time)
 //   - All logs go through config.logger (ConvexLogger callback) — no debugPrint
 
 import 'dart:async';
@@ -115,6 +119,21 @@ class WebConvexClient implements IConvexClient {
 
   /// Current auth token
   String? _currentAuthToken;
+
+  /// Tracks an in-flight initial auth setup: set on entry to
+  /// [setAuthWithRefresh] and completed after the first `setAuth(token)` has
+  /// been pushed to the WS, then nulled out. Steady-state subscribes pay
+  /// nothing — `await null?.future` is a no-op.
+  ///
+  /// During initial auth, [subscribe] awaits this future so the server
+  /// processes Authenticate before the Subscribe message. Without it,
+  /// subscribes that race the bridge's setAuthWithRefresh land at the server
+  /// unauthenticated and fail with NOT_AUTHENTICATED on auth-required queries.
+  ///
+  /// Only the *first* setAuth roundtrip is gated; subsequent refresh-loop
+  /// rotations don't toggle this (the old token is valid until the new one
+  /// arrives, so subscribes never see an unauthenticated WS during a refresh).
+  Completer<void>? _authInFlight;
 
   /// Lifecycle observer for app state changes
   late final AppLifecycleObserver _lifecycleObserver;
@@ -956,6 +975,11 @@ class WebConvexClient implements IConvexClient {
     required void Function(String) onUpdate,
     required void Function(String, String?) onError,
   }) async {
+    // Wait if setAuthWithRefresh is mid-flight, so Authenticate reaches the
+    // server before this Subscribe. Outside of initial auth setup this is a
+    // no-op (`_authInFlight` is null). See the [_authInFlight] field docs.
+    await _authInFlight?.future;
+
     // Use incrementing query ID (Convex protocol requirement)
     final queryId = _queryIdCounter++;
     final queryIdStr = queryId.toString();
@@ -1135,6 +1159,15 @@ class WebConvexClient implements IConvexClient {
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
   }) async {
+    // Open the in-flight gate: any subscribe issued before the first
+    // `setAuth(token)` returns from the WS will wait on this completer.
+    // Defensive: if a previous call left one open (shouldn't normally
+    // happen — caller is expected to dispose first), complete it so
+    // existing waiters proceed against the new auth setup.
+    final completer = Completer<void>();
+    _authInFlight?.complete();
+    _authInFlight = completer;
+
     // Buffer time before token expiry to trigger refresh.
     const refreshBuffer = Duration(seconds: 60);
     // Minimum refresh interval to prevent tight loops on errors.
@@ -1221,8 +1254,15 @@ class WebConvexClient implements IConvexClient {
       refresh();
     });
 
-    // Kick off the initial fetch + schedule.
-    await refresh();
+    // Kick off the initial fetch + schedule. Use try/finally so the
+    // in-flight gate is always released even if `refresh()` throws —
+    // otherwise subscribes waiting on the completer would hang forever.
+    try {
+      await refresh();
+    } finally {
+      if (!completer.isCompleted) completer.complete();
+      if (identical(_authInFlight, completer)) _authInFlight = null;
+    }
 
     return _WebAuthHandle(
       isAuth: _currentAuthToken != null,
