@@ -72,6 +72,20 @@ class NativeConvexClient implements IConvexClient {
   Future<String?> Function()? _lastTokenFetcher;
   void Function(bool)? _lastOnAuthChange;
 
+  /// Tracks an in-flight initial auth setup: set on entry to
+  /// [setAuthWithRefresh] and completed after the Rust SDK pushes the first
+  /// token to the WS, then nulled out. Steady-state subscribes pay nothing —
+  /// `await null?.future` is a no-op.
+  ///
+  /// During initial auth, [subscribe] awaits this future so the server
+  /// processes Authenticate before the Subscribe message. Without it,
+  /// subscribes that race the caller's setAuthWithRefresh land at the server
+  /// unauthenticated and fail with NOT_AUTHENTICATED on auth-required queries.
+  ///
+  /// Only the *first* setAuth roundtrip is gated; subsequent refresh-loop
+  /// rotations (handled inside the Rust SDK) don't toggle this.
+  Completer<void>? _authInFlight;
+
   /// Guard against re-entrant reconnects (resumed fires multiple times on iOS).
   bool _reconnectInProgress = false;
 
@@ -207,6 +221,11 @@ class NativeConvexClient implements IConvexClient {
     required void Function(String) onUpdate,
     required void Function(String, String?) onError,
   }) async {
+    // Wait if setAuthWithRefresh is mid-flight, so Authenticate reaches the
+    // server before this Subscribe. Outside of initial auth setup this is a
+    // no-op (`_authInFlight` is null). See the [_authInFlight] field docs.
+    await _authInFlight?.future;
+
     final formattedArgs = buildArgs(args);
     final id = _nextSubId++;
     final tracked = _TrackedSubscription(
@@ -305,18 +324,34 @@ class NativeConvexClient implements IConvexClient {
     _lastTokenFetcher = tokenFetcher;
     _lastOnAuthChange = onAuthChange;
 
+    // Open the in-flight gate so subscribes issued before the first
+    // `setAuth(token)` returns from the WS wait for Authenticate to land.
+    // Defensive: if a previous call left one open (caller didn't dispose),
+    // complete it so existing waiters proceed against the new auth setup.
+    final completer = Completer<void>();
+    _authInFlight?.complete();
+    _authInFlight = completer;
+
     // The Rust SDK manages the JWT-aware refresh loop and only fires
     // on_auth_change on transitions — which matches our public contract.
-    final handle = await _rustClient.setAuthWithRefresh(
-      fetchToken: () async => await tokenFetcher(),
-      onAuthChange: (bool isAuth) async {
-        onAuthChange?.call(isAuth);
-        _authStateController.add(isAuth);
-      },
-    );
+    // Use try/finally so the in-flight gate is always released, even if
+    // the Rust side throws — otherwise subscribes waiting on the completer
+    // would hang forever.
+    try {
+      final handle = await _rustClient.setAuthWithRefresh(
+        fetchToken: () async => await tokenFetcher(),
+        onAuthChange: (bool isAuth) async {
+          onAuthChange?.call(isAuth);
+          _authStateController.add(isAuth);
+        },
+      );
 
-    _currentAuthHandle = handle;
-    return handle;
+      _currentAuthHandle = handle;
+      return handle;
+    } finally {
+      if (!completer.isCompleted) completer.complete();
+      if (identical(_authInFlight, completer)) _authInFlight = null;
+    }
   }
 
   @override
