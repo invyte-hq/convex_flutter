@@ -360,26 +360,26 @@ class ConvexClient {
   @Deprecated('Use connectionState stream for real-time connection monitoring')
   Future<ConnectionStatus> checkConnection() => _impl.checkConnection();
 
-  /// Attempts to reconnect to the Convex backend.
+  /// Rebuilds the transport, replays auth, and re-fires every active
+  /// subscription — the consumer's subscription handles stay valid across the
+  /// reconnect, so the UI sees only a brief connection blip.
   ///
-  /// This method calls [checkConnection] and returns true if the
-  /// connection check succeeds, false otherwise.
+  /// [url] — when non-null, switches the live client to a *different* Convex
+  /// deployment (the dev-only in-app deployment switcher) without tearing down
+  /// the client; when null, reconnects to the current deployment. The native
+  /// client also fires the no-`url` form automatically when the app returns to
+  /// the foreground after a real background, so manual calls are rarely needed.
   ///
-  /// Typically called after the app resumes from background or
-  /// after detecting a network interruption.
+  /// Returns a best-effort, transport-dependent success flag (native: auth +
+  /// all re-subscribes succeeded; web: socket reached open). It's advisory —
+  /// observe [connectionState] for authoritative status, since "connected" and
+  /// the first post-reconnect data still flow asynchronously.
   ///
-  /// Example usage:
+  /// Example — switch deployment (dev tooling):
   /// ```dart
-  /// ConvexClient.instance.lifecycleEvents.listen((event) {
-  ///   if (event == AppLifecycleEvent.resumed) {
-  ///     final connected = await ConvexClient.instance.reconnect();
-  ///     if (connected) {
-  ///       print('Reconnected successfully');
-  ///     }
-  ///   }
-  /// });
+  /// await ConvexClient.instance.reconnect(url: otherDeploymentUrl);
   /// ```
-  Future<bool> reconnect() => _impl.reconnect();
+  Future<bool> reconnect({String? url}) => _impl.reconnect(url: url);
 
   // ============================================================================
   // Lifecycle Management API
