@@ -128,6 +128,21 @@ abstract class MobileConvexClient implements RustOpaqueInterface {
     required FutureOr<void> Function(bool) onAuthChange,
   });
 
+  /// Repoints this client at a different deployment URL and drops the inner
+  /// client so the next operation builds a fresh WebSocket against the new
+  /// deployment. This is the native primitive behind the in-app deployment
+  /// switcher (W5): the same `MobileConvexClient` instance, tokio runtime, and
+  /// websocket-state channel are kept alive; only the inner Convex client is
+  /// recreated against the new address (the URL is immutable inside the Convex
+  /// SDK, so swapping deployments requires a transport rebuild).
+  ///
+  /// Like [`force_reconnect`], callers (Dart side) must replay auth via
+  /// [`set_auth_with_refresh`] and re-fire any active subscriptions afterwards
+  /// — the previous [`AuthHandle`]/[`SubscriptionHandle`] values point at the
+  /// dropped client. Auth tokens validate across deployments that share an
+  /// issuer, so no re-login is needed when switching among them.
+  Future<void> setDeploymentUrl({required String url});
+
   /// Subscribes to real-time updates from a Convex query.
   Future<SubscriptionHandle> subscribe({
     required String name,

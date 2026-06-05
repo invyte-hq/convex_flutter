@@ -10,15 +10,6 @@ import 'package:convex_flutter/src/convex_logger.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
 import 'package:convex_flutter/src/app_lifecycle_observer.dart';
 
-/// If a subscription has not delivered an update within this window, treat the
-/// underlying WebSocket as potentially stale on app resume and force-reconnect.
-///
-/// iOS suspends the entire process within ~30s of backgrounding, which leaves
-/// the WebSocket in a zombie state. The Rust SDK's 5s heartbeat / 30s
-/// inactivity threshold (see web_socket_manager.rs) eventually detects this,
-/// but users perceive the staleness immediately on resume — so we short-circuit.
-const Duration _staleActivityThreshold = Duration(seconds: 10);
-
 /// Native (FFI-based) implementation of Convex client.
 ///
 /// This implementation uses Flutter Rust Bridge to call into the official
@@ -56,14 +47,26 @@ class NativeConvexClient implements IConvexClient {
   /// Lifecycle observer for app state changes
   late final AppLifecycleObserver _lifecycleObserver;
 
+  /// Hard ceiling on a single reconnect attempt. The reconnect body re-fires
+  /// subscriptions, whose underlying FFI calls park until the new socket is
+  /// connected (the SDK acks Subscribe only after a live-socket flush). Bounding
+  /// the whole body guarantees the single-flight guard is always released — even
+  /// if the network never comes back — so a later resume can retry instead of
+  /// being silently dropped forever. (The native layer also bounds each
+  /// subscribe; this is the Dart-side belt for the whole orchestration.)
+  static const Duration _reconnectTimeout = Duration(seconds: 20);
+
+  /// Backoff + cap for retrying a reconnect that failed or timed out (e.g. the
+  /// network was briefly unavailable right after resume). Bounded so we don't
+  /// spin forever; convex's own ~35s inactivity heartbeat is the ultimate
+  /// backstop if every retry is exhausted.
+  static const Duration _reconnectRetryDelay = Duration(seconds: 3);
+  static const int _maxReconnectRetries = 4;
+
   /// Active subscriptions, keyed by an internal monotonic id. Tracked so we
   /// can re-fire them after [reconnect] tears down the inner Rust client.
   final Map<int, _TrackedSubscription> _activeSubs = {};
   int _nextSubId = 1;
-
-  /// Wall-clock time of the most recent server activity (subscription update,
-  /// query result, etc.) — used to decide whether a resume needs a reconnect.
-  DateTime? _lastServerActivity;
 
   /// Auth state remembered for replay across [reconnect]. Native auth lives
   /// inside the Rust client, so a force-drop invalidates it; we stash the
@@ -86,8 +89,34 @@ class NativeConvexClient implements IConvexClient {
   /// rotations (handled inside the Rust SDK) don't toggle this.
   Completer<void>? _authInFlight;
 
-  /// Guard against re-entrant reconnects (resumed fires multiple times on iOS).
+  /// Single-flight guard: only one reconnect body runs at a time (resumed fires
+  /// multiple times on iOS, and a URL switch can race a resume). Always cleared
+  /// in [reconnect]'s finally — bounded by [_reconnectTimeout] so it can never
+  /// latch forever.
   bool _reconnectInProgress = false;
+
+  /// Coalesces reconnect requests that arrive while one is in flight, so they're
+  /// not dropped. A URL switch ([_queuedUrl] non-null) takes precedence over a
+  /// plain resume-reconnect when the in-flight attempt drains the queue.
+  bool _reconnectQueued = false;
+  String? _queuedUrl;
+
+  /// Monotonic token identifying the live reconnect attempt. A body that times
+  /// out keeps running in the background; this lets a newer attempt supersede it
+  /// so a late-finishing orphan can't clobber the newer attempt's subscription
+  /// handles.
+  int _reconnectGeneration = 0;
+
+  /// Bounded retry for a reconnect that failed/timed out (network not yet up).
+  Timer? _reconnectRetryTimer;
+  int _reconnectRetryCount = 0;
+
+  /// True once a real background (`paused`) occurred since the last `resumed`.
+  /// This — not wall-clock activity timing — is the signal that the OS may have
+  /// suspended the process and reclaimed the socket, so a resume needs a
+  /// reconnect. A mere `inactive` peek (Control Center, notification shade,
+  /// app-switcher) never sets it, so healthy sockets aren't churned.
+  bool _didBackgroundSinceResume = false;
 
   /// Set once [dispose] runs, so late-firing lifecycle callbacks are ignored.
   bool _disposed = false;
@@ -121,11 +150,20 @@ class NativeConvexClient implements IConvexClient {
 
     // Setup lifecycle observer. We both forward events to the public stream
     // AND act on resume to recover stale subscriptions after iOS suspension.
+    // `paused`/`detached` mark a real background (process may be suspended and
+    // the socket reclaimed); `resumed` then triggers a reconnect only if such a
+    // background actually happened — see [_didBackgroundSinceResume].
     client._lifecycleObserver = AppLifecycleObserver(
       onLifecycleChange: (event) {
         client._lifecycleController.add(event);
-        if (event == AppLifecycleEvent.resumed) {
-          client._maybeReconnectOnResume();
+        switch (event) {
+          case AppLifecycleEvent.paused:
+          case AppLifecycleEvent.detached:
+            client._didBackgroundSinceResume = true;
+          case AppLifecycleEvent.resumed:
+            client._maybeReconnectOnResume();
+          case AppLifecycleEvent.inactive:
+            break;
         }
       },
     );
@@ -151,10 +189,13 @@ class NativeConvexClient implements IConvexClient {
             'native',
             'WS state changed: ${state.name}',
           );
+          if (_disposed) return;
           _currentConnectionState = state;
-          _connectionStateController.add(state);
+          if (!_connectionStateController.isClosed) {
+            _connectionStateController.add(state);
+          }
           if (state == WebSocketConnectionState.connected) {
-            _lastServerActivity = DateTime.now();
+            _restoreOrphanedSubscriptionsIfAny();
           }
         },
       );
@@ -184,7 +225,6 @@ class NativeConvexClient implements IConvexClient {
     final result = await _rustClient
         .query(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    _lastServerActivity = DateTime.now();
     return _normalize(result);
   }
 
@@ -197,7 +237,6 @@ class NativeConvexClient implements IConvexClient {
     final result = await _rustClient
         .mutation(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    _lastServerActivity = DateTime.now();
     return _normalize(result);
   }
 
@@ -210,7 +249,6 @@ class NativeConvexClient implements IConvexClient {
     final result = await _rustClient
         .action(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    _lastServerActivity = DateTime.now();
     return _normalize(result);
   }
 
@@ -253,7 +291,6 @@ class NativeConvexClient implements IConvexClient {
   }
 
   void _dispatchOnUpdate(_TrackedSubscription tracked, String value) {
-    _lastServerActivity = DateTime.now();
     if (tracked.canceled) return;
     try {
       tracked.userOnUpdate(_normalize(value));
@@ -283,6 +320,13 @@ class NativeConvexClient implements IConvexClient {
     }
   }
 
+  /// Emits an auth-state change, guarded against a closed controller — a Rust
+  /// refresh-loop callback can fire after [dispose] has closed the stream.
+  void _emitAuthState(bool isAuthenticated) {
+    if (_disposed || _authStateController.isClosed) return;
+    _authStateController.add(isAuthenticated);
+  }
+
   void _cancelTracked(int id) {
     final tracked = _activeSubs.remove(id);
     if (tracked == null) return;
@@ -307,7 +351,7 @@ class NativeConvexClient implements IConvexClient {
     _lastOnAuthChange = null;
 
     await _rustClient.setAuth(token: token);
-    _authStateController.add(token != null);
+    _emitAuthState(token != null);
   }
 
   @override
@@ -342,7 +386,7 @@ class NativeConvexClient implements IConvexClient {
         fetchToken: () async => await tokenFetcher(),
         onAuthChange: (bool isAuth) async {
           onAuthChange?.call(isAuth);
-          _authStateController.add(isAuth);
+          _emitAuthState(isAuth);
         },
       );
 
@@ -361,7 +405,7 @@ class NativeConvexClient implements IConvexClient {
     _lastTokenFetcher = null;
     _lastOnAuthChange = null;
     await _rustClient.setAuth(token: null);
-    _authStateController.add(false);
+    _emitAuthState(false);
   }
 
   @override
@@ -408,115 +452,278 @@ class NativeConvexClient implements IConvexClient {
     }
   }
 
-  /// Tears down the underlying Rust client, replays auth, and re-fires every
-  /// tracked subscription. Idempotent — concurrent calls deduplicate.
+  /// Reconnects the underlying transport and replays auth + every tracked
+  /// subscription. With [url], repoints the live client at a *different*
+  /// deployment (the W5 in-app deployment switcher); without it, rebuilds the
+  /// connection against the current deployment (the resume-recovery path).
   ///
-  /// Returns true once the new connection is wired and at least the auth/sub
-  /// replay completed without throwing. Note that "connected" still flows
-  /// asynchronously through [connectionState].
+  /// Single-flight and self-healing: a call that arrives while one is already
+  /// running is coalesced rather than run concurrently (a URL switch is never
+  /// dropped behind a resume-reconnect); the body is bounded by
+  /// [_reconnectTimeout] so the guard can never latch forever (the bug this
+  /// fixes: an FFI re-subscribe parking on an unready socket used to wedge every
+  /// future resume); and a failed/timed-out attempt schedules a bounded retry.
+  ///
+  /// Returns true if the attempt wired auth and re-fired all subscriptions
+  /// without error. "Connected" still flows asynchronously via [connectionState].
   @override
-  Future<bool> reconnect() async {
+  Future<bool> reconnect({String? url}) async {
     if (_disposed) return false;
-    if (_reconnectInProgress) return false;
+
+    // Coalesce: if a reconnect is already running, remember that another is
+    // wanted rather than running two bodies concurrently (which would race on
+    // the inner client and _activeSubs). A URL switch wins over a plain resume.
+    if (_reconnectInProgress) {
+      _reconnectQueued = true;
+      if (url != null) _queuedUrl = url;
+      return false;
+    }
+
     _reconnectInProgress = true;
-
-    config.logger(
-      ConvexLogLevel.debug,
-      'native',
-      'Forcing reconnect (activeSubs=${_activeSubs.length}, hasAuth=${_currentAuthHandle != null})',
-    );
-
+    final gen = ++_reconnectGeneration;
+    var result = false;
     try {
-      // Snapshot what we need to restore. Cancelling a tracked sub mid-loop
-      // removes it from _activeSubs, so iterate over a copy.
-      final subsToReplay = _activeSubs.values.toList(growable: false);
-      final authFetcher = _lastTokenFetcher;
-      final authOnChange = _lastOnAuthChange;
-
-      // 1) Tear down the existing Rust subscription tasks. Their cancel
-      //    sender flips the spawned task into clean exit; the user's
-      //    callback refs are dropped on the Rust side.
-      for (final sub in subsToReplay) {
-        try {
-          sub.currentHandle?.cancel();
-        } catch (_) {}
-        sub.currentHandle = null;
-      }
-
-      // 2) Drop the auth refresh loop — it holds a clone of the Convex
-      //    client and would keep poking the dead instance otherwise.
-      _currentAuthHandle?.dispose();
-      _currentAuthHandle = null;
-
-      // 3) Drop the inner Rust ConvexClient. Next call to query/subscribe
-      //    will lazily rebuild a fresh WebSocket.
-      await _rustClient.forceReconnect();
-
-      // 4) Replay auth so the new client is authenticated before any
-      //    subscriptions go out. Skip if the consumer never used the
-      //    refresh-based auth (they're responsible for their own setAuth).
-      if (authFetcher != null) {
-        final handle = await _rustClient.setAuthWithRefresh(
-          fetchToken: () async => await authFetcher(),
-          onAuthChange: (bool isAuth) async {
-            authOnChange?.call(isAuth);
-            _authStateController.add(isAuth);
-          },
-        );
-        _currentAuthHandle = handle;
-      }
-
-      // 5) Re-fire every still-tracked subscription. Skip entries that
-      //    were cancelled mid-reconnect.
-      for (final sub in subsToReplay) {
-        if (!_activeSubs.containsKey(sub.id)) continue;
-        try {
-          sub.currentHandle = await _rustClient.subscribe(
-            name: sub.name,
-            args: sub.formattedArgs,
-            onUpdate: (value) => _dispatchOnUpdate(sub, value),
-            onError: (message, value) => _dispatchOnError(sub, message, value),
-          );
-        } catch (e, st) {
+      result = await _performReconnect(url, gen).timeout(
+        _reconnectTimeout,
+        onTimeout: () {
           config.logger(
-            ConvexLogLevel.error,
+            ConvexLogLevel.warn,
             'native',
-            'Failed to re-subscribe "${sub.name}" after reconnect: $e\n$st',
+            'Reconnect timed out after ${_reconnectTimeout.inSeconds}s; '
+                'releasing guard so a later trigger can retry',
           );
-        }
-      }
-
-      return true;
+          return false;
+        },
+      );
     } catch (e, st) {
       config.logger(
         ConvexLogLevel.error,
         'native',
         'Reconnect failed: $e\n$st',
       );
-      return false;
+      result = false;
     } finally {
       _reconnectInProgress = false;
     }
+
+    if (_disposed) return result;
+
+    // Drain a coalesced request (e.g. a URL switch that arrived mid-reconnect).
+    if (_reconnectQueued) {
+      _reconnectQueued = false;
+      final next = _queuedUrl;
+      _queuedUrl = null;
+      return reconnect(url: next);
+    }
+
+    // Otherwise settle the retry budget: clear it on success, or schedule a
+    // bounded retry if the attempt failed/timed out (network still settling).
+    if (result) {
+      _reconnectRetryCount = 0;
+      _reconnectRetryTimer?.cancel();
+    } else {
+      _scheduleReconnectRetry();
+    }
+    return result;
   }
 
-  /// Lifecycle hook: skip the reconnect if the socket has seen recent traffic.
-  /// On iOS, [AppLifecycleEvent.resumed] also fires during quick app-switches
-  /// where the connection is still healthy — no point churning the socket.
-  void _maybeReconnectOnResume() {
+  /// The reconnect body. [gen] tags this attempt; because a body that exceeds
+  /// [_reconnectTimeout] is abandoned by [reconnect] but keeps running, every
+  /// shared-state write first checks it is still the live attempt
+  /// (`gen == _reconnectGeneration`) so a late orphan can't clobber a newer
+  /// attempt's auth handle or subscription handles.
+  Future<bool> _performReconnect(String? url, int gen) async {
+    config.logger(
+      ConvexLogLevel.debug,
+      'native',
+      'Reconnect (gen=$gen, target=${url ?? 'same deployment'}, '
+          'activeSubs=${_activeSubs.length}, hasAuth=${_lastTokenFetcher != null})',
+    );
+
+    // Snapshot what we need to restore. Cancelling a tracked sub mid-loop
+    // removes it from _activeSubs, so iterate over a copy.
+    final subsToReplay = _activeSubs.values.toList(growable: false);
+    final authFetcher = _lastTokenFetcher;
+    final authOnChange = _lastOnAuthChange;
+
+    // 1) Tear down the existing Rust subscription tasks. Their cancel sender
+    //    flips the spawned task into clean exit; the user's callback refs are
+    //    dropped on the Rust side.
+    for (final sub in subsToReplay) {
+      try {
+        sub.currentHandle?.cancel();
+      } catch (_) {}
+      sub.currentHandle = null;
+    }
+
+    // 2) Drop the auth refresh loop — it holds a clone of the Convex client and
+    //    would keep poking the dead instance otherwise.
+    _currentAuthHandle?.dispose();
+    _currentAuthHandle = null;
+
+    // 3) Rebuild the transport. With a url, repoint at the new deployment;
+    //    otherwise drop the inner client so the next op builds a fresh socket
+    //    against the current deployment. Both leave the client null so the auth
+    //    step lazily rebuilds it.
+    if (url != null) {
+      await _rustClient.setDeploymentUrl(url: url);
+    } else {
+      await _rustClient.forceReconnect();
+    }
+    if (gen != _reconnectGeneration) return false;
+
+    // 4) Replay auth BEFORE re-subscribing. Push the initial token directly via
+    //    setAuth first so Authenticate is enqueued on the worker's FIFO ahead of
+    //    the re-Subscribes below — without this, re-Subscribes can reach the
+    //    server before Authenticate and briefly fail auth-required queries
+    //    (NOT_AUTHENTICATED). Then start the refresh loop for ongoing rotation.
+    //    Skip entirely if the consumer never used refresh-based auth (they own
+    //    their setAuth).
+    //
+    //    NOTE: the refresh loop's own first push (a second Authenticate) may
+    //    trail the re-Subscribes — that's intentionally benign. The server
+    //    treats a re-sent valid token at a higher monotonic identity version as
+    //    a legitimate update, not an AuthError. Don't try to "fix" it by
+    //    awaiting the loop's first push: that push happens inside the spawned
+    //    Rust task and isn't awaitable from here — which is exactly why the
+    //    explicit setAuth above is what guarantees the ordering.
+    if (authFetcher != null) {
+      String? initialToken;
+      try {
+        initialToken = await authFetcher();
+      } catch (e) {
+        config.logger(
+          ConvexLogLevel.warn,
+          'native',
+          'Token fetch during reconnect threw: $e',
+        );
+        initialToken = null;
+      }
+      if (gen != _reconnectGeneration) return false;
+
+      await _rustClient.setAuth(token: initialToken);
+
+      final handle = await _rustClient.setAuthWithRefresh(
+        fetchToken: () async => await authFetcher(),
+        onAuthChange: (bool isAuth) async {
+          authOnChange?.call(isAuth);
+          _emitAuthState(isAuth);
+        },
+      );
+      if (gen != _reconnectGeneration) {
+        handle.dispose();
+        return false;
+      }
+      _currentAuthHandle = handle;
+    }
+
+    // 5) Re-fire every still-tracked subscription. A failure here marks the sub
+    //    [_TrackedSubscription.needsRestore] and fails the attempt, so it's
+    //    re-tried (by the bounded retry, or when the socket next reconnects via
+    //    [_restoreOrphanedSubscriptionsIfAny]) rather than silently stranded.
+    var allOk = true;
+    for (final sub in subsToReplay) {
+      if (gen != _reconnectGeneration) return false;
+      if (!_activeSubs.containsKey(sub.id)) continue;
+      try {
+        final handle = await _rustClient.subscribe(
+          name: sub.name,
+          args: sub.formattedArgs,
+          onUpdate: (value) => _dispatchOnUpdate(sub, value),
+          onError: (message, value) => _dispatchOnError(sub, message, value),
+        );
+        // A newer attempt may have superseded us mid-await; don't clobber its
+        // fresh handle with this now-stale one.
+        if (gen != _reconnectGeneration) {
+          try {
+            handle.cancel();
+          } catch (_) {}
+          return false;
+        }
+        sub.currentHandle = handle;
+        sub.needsRestore = false;
+      } catch (e, st) {
+        allOk = false;
+        sub.needsRestore = true;
+        config.logger(
+          ConvexLogLevel.error,
+          'native',
+          'Failed to re-subscribe "${sub.name}" after reconnect: $e\n$st',
+        );
+      }
+    }
+
+    return allOk;
+  }
+
+  /// Schedules a bounded, delayed retry after a failed/timed-out reconnect (the
+  /// network may still be coming up right after resume). Capped by
+  /// [_maxReconnectRetries]; convex's own inactivity heartbeat is the backstop
+  /// once retries are exhausted.
+  void _scheduleReconnectRetry() {
     if (_disposed) return;
-    final last = _lastServerActivity;
-    final isStale =
-        last == null ||
-        DateTime.now().difference(last) >= _staleActivityThreshold;
-    if (!isStale) {
+    if (_reconnectRetryCount >= _maxReconnectRetries) {
       config.logger(
-        ConvexLogLevel.debug,
+        ConvexLogLevel.warn,
         'native',
-        'Resume detected, skipping reconnect (last activity ${DateTime.now().difference(last).inMilliseconds}ms ago)',
+        'Reconnect retries exhausted ($_maxReconnectRetries); '
+            'relying on SDK heartbeat to recover',
       );
       return;
     }
-    // Fire-and-forget; reconnect() guards re-entrancy internally.
+    _reconnectRetryCount++;
+    _reconnectRetryTimer?.cancel();
+    _reconnectRetryTimer = Timer(_reconnectRetryDelay, () {
+      if (_disposed) return;
+      config.logger(
+        ConvexLogLevel.debug,
+        'native',
+        'Retrying reconnect (attempt $_reconnectRetryCount/$_maxReconnectRetries)',
+      );
+      unawaited(reconnect());
+    });
+  }
+
+  /// Restores subscriptions stranded by a prior reconnect whose re-subscribe
+  /// failed while the socket was down (e.g. the network only returned after the
+  /// bounded retries were exhausted). The freshly-`connected` socket is the
+  /// trigger: re-run reconnect to re-fire the still-stranded subs. Keyed off the
+  /// explicit [_TrackedSubscription.needsRestore] flag, NOT a null handle —
+  /// handles are also transiently null during a normal initial subscribe, which
+  /// must not provoke a reconnect. Skipped mid-reconnect (the single-flight
+  /// coalesce would queue it anyway; skipping avoids needless churn).
+  void _restoreOrphanedSubscriptionsIfAny() {
+    if (_disposed || _reconnectInProgress) return;
+    final hasStranded = _activeSubs.values.any((s) => s.needsRestore);
+    if (!hasStranded) return;
+    config.logger(
+      ConvexLogLevel.debug,
+      'native',
+      'Socket connected with stranded subscriptions — re-firing to restore',
+    );
+    unawaited(reconnect());
+  }
+
+  /// Lifecycle hook: reconnect on resume only if a real background actually
+  /// happened since the last resume. `paused`/`detached` set
+  /// [_didBackgroundSinceResume] (the OS may have suspended us and reclaimed the
+  /// socket); a mere `inactive` peek (Control Center, notification shade,
+  /// app-switcher) does not, so healthy sockets aren't churned on quick
+  /// app-switches.
+  void _maybeReconnectOnResume() {
+    if (_disposed) return;
+    if (!_didBackgroundSinceResume) {
+      config.logger(
+        ConvexLogLevel.debug,
+        'native',
+        'Resume without a preceding background — skipping reconnect',
+      );
+      return;
+    }
+    _didBackgroundSinceResume = false;
+    // Fresh user-driven foregrounding: reset the retry budget.
+    _reconnectRetryCount = 0;
+    // Fire-and-forget; reconnect() is single-flight + self-healing internally.
     unawaited(reconnect());
   }
 
@@ -534,6 +741,10 @@ class NativeConvexClient implements IConvexClient {
   @override
   void dispose() {
     _disposed = true;
+    // Supersede any in-flight reconnect body so it bails at its next gen-check
+    // instead of writing to _currentAuthHandle / the closed controllers below.
+    _reconnectGeneration++;
+    _reconnectRetryTimer?.cancel();
     for (final sub in _activeSubs.values) {
       sub.canceled = true;
       try {
@@ -562,6 +773,12 @@ class _TrackedSubscription {
 
   SubscriptionHandle? currentHandle;
   bool canceled = false;
+
+  /// Set when a reconnect's re-subscribe for this sub failed (socket down), so
+  /// it's known to need restoring once the socket is back — see
+  /// [NativeConvexClient._restoreOrphanedSubscriptionsIfAny]. Distinct from a
+  /// transiently-null [currentHandle] during a normal initial subscribe.
+  bool needsRestore = false;
 
   _TrackedSubscription({
     required this.id,

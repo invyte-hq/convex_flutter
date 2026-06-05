@@ -94,6 +94,12 @@ class WebConvexClient implements IConvexClient {
   /// WebSocket connection to Convex backend
   web.WebSocket? _ws;
 
+  /// The deployment URL this client is currently connected to. Seeded from
+  /// [ConvexConfig.deploymentUrl]; overridable via [reconnect]'s `url` param
+  /// (the in-app deployment switcher). [_connect] reads this rather than the
+  /// immutable config so a switch takes effect on the next connection.
+  late String _activeDeploymentUrl = config.deploymentUrl;
+
   /// Stream controller for auth state changes (public via [authState]).
   final StreamController<bool> _authStateController =
       StreamController<bool>.broadcast();
@@ -268,7 +274,7 @@ class WebConvexClient implements IConvexClient {
     try {
       // Convert HTTPS to WSS URL with correct Convex sync endpoint
       // Format: wss://deployment.convex.cloud/api/{version}/sync
-      final wsUrl = config.deploymentUrl.replaceFirst('https', 'wss');
+      final wsUrl = _activeDeploymentUrl.replaceFirst('https', 'wss');
       final fullUrl = '$wsUrl/api/sync';
 
       config.logger(ConvexLogLevel.debug, 'web', 'WebSocket URL: $fullUrl');
@@ -1343,27 +1349,52 @@ class WebConvexClient implements IConvexClient {
   }
 
   @override
-  Future<bool> reconnect() async {
-    config.logger(ConvexLogLevel.debug, 'web', 'Manual reconnect requested');
+  Future<bool> reconnect({String? url}) async {
+    config.logger(
+      ConvexLogLevel.debug,
+      'web',
+      'Manual reconnect requested${url != null ? ' (switching deployment)' : ''}',
+    );
 
-    // Close existing connection if any
-    _ws?.close();
+    // Detach the old socket's handlers BEFORE closing it. Its onclose otherwise
+    // fires _scheduleReconnect(), which races this method's own _connect() and
+    // would spin up a second socket (to a possibly stale URL) — a latent
+    // double-connect. Nulling the handlers silences the superseded socket so
+    // only our explicit _connect() below brings up the new one.
+    final old = _ws;
+    if (old != null) {
+      old.onopen = null;
+      old.onclose = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.close();
+    }
     _ws = null;
 
-    // Force a fresh server session on manual reconnect
+    // Cancel any pending auto-reconnect scheduled by a prior drop.
+    _reconnectTimer?.cancel();
+
+    // Switch deployment if requested — _connect() reads _activeDeploymentUrl.
+    // Also drop any messages queued for the OLD deployment's session: flushing
+    // them against the new deployment's fresh (version-0) session would desync
+    // the query-set version counters.
+    if (url != null) {
+      _activeDeploymentUrl = url;
+      _messageQueue.clear();
+    }
+
+    // Force a fresh server session: a new deployment (or a clean manual
+    // reconnect) must not try to resume the old session's version counters.
     _sessionId = null;
     _connectionCount = 0;
-
-    // Reset reconnection counter for manual reconnect
     _reconnectAttempts = 0;
 
-    // Attempt connection
     try {
       await _connect();
-
-      // Wait a bit for connection to establish
+      // Give the socket a moment to open so the returned bool is meaningful.
+      // Auth (Authenticate) and re-subscription are driven by onopen regardless,
+      // in the correct order (Connect → Authenticate → flush → resubscribe).
       await Future.delayed(const Duration(seconds: 2));
-
       return isConnected;
     } catch (e) {
       config.logger(ConvexLogLevel.error, 'web', 'Manual reconnect failed: $e');

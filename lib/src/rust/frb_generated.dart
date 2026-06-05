@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => -392724412;
+  int get rustContentHash => -275328595;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -143,6 +143,11 @@ abstract class RustLibApi extends BaseApi {
     required MobileConvexClient that,
     required FutureOr<String?> Function() fetchToken,
     required FutureOr<void> Function(bool) onAuthChange,
+  });
+
+  Future<void> crateMobileConvexClientSetDeploymentUrl({
+    required MobileConvexClient that,
+    required String url,
   });
 
   Future<SubscriptionHandle> crateMobileConvexClientSubscribe({
@@ -734,6 +739,44 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<void> crateMobileConvexClientSetDeploymentUrl({
+    required MobileConvexClient that,
+    required String url,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMobileConvexClient(
+            that,
+            serializer,
+          );
+          sse_encode_String(url, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 15,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_client_error,
+        ),
+        constMeta: kCrateMobileConvexClientSetDeploymentUrlConstMeta,
+        argValues: [that, url],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateMobileConvexClientSetDeploymentUrlConstMeta =>
+      const TaskConstMeta(
+        debugName: "MobileConvexClient_set_deployment_url",
+        argNames: ["that", "url"],
+      );
+
+  @override
   Future<SubscriptionHandle> crateMobileConvexClientSubscribe({
     required MobileConvexClient that,
     required String name,
@@ -762,7 +805,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 15,
+            funcId: 16,
             port: port_,
           );
         },
@@ -794,7 +837,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 16)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 17)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -2261,6 +2304,22 @@ class MobileConvexClientImpl extends RustOpaque implements MobileConvexClient {
     fetchToken: fetchToken,
     onAuthChange: onAuthChange,
   );
+
+  /// Repoints this client at a different deployment URL and drops the inner
+  /// client so the next operation builds a fresh WebSocket against the new
+  /// deployment. This is the native primitive behind the in-app deployment
+  /// switcher (W5): the same `MobileConvexClient` instance, tokio runtime, and
+  /// websocket-state channel are kept alive; only the inner Convex client is
+  /// recreated against the new address (the URL is immutable inside the Convex
+  /// SDK, so swapping deployments requires a transport rebuild).
+  ///
+  /// Like [`force_reconnect`], callers (Dart side) must replay auth via
+  /// [`set_auth_with_refresh`] and re-fire any active subscriptions afterwards
+  /// — the previous [`AuthHandle`]/[`SubscriptionHandle`] values point at the
+  /// dropped client. Auth tokens validate across deployments that share an
+  /// issuer, so no re-login is needed when switching among them.
+  Future<void> setDeploymentUrl({required String url}) => RustLib.instance.api
+      .crateMobileConvexClientSetDeploymentUrl(that: this, url: url);
 
   /// Subscribes to real-time updates from a Convex query.
   Future<SubscriptionHandle> subscribe({

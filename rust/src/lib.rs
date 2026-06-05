@@ -65,6 +65,19 @@ impl From<anyhow::Error> for ClientError {
     }
 }
 
+/// Upper bound on how long a single `subscribe` may wait for the worker to
+/// flush its Subscribe message to a live socket.
+///
+/// The Convex SDK worker only acks a Subscribe after `communicate()` flushes it
+/// to a *connected* socket (see convex `client/worker.rs`); on a dead or
+/// still-connecting socket that flush parks until the connection comes up. With
+/// no ceiling an FFI `subscribe` — e.g. one fired by the Dart resume-reconnect
+/// while the iOS network stack isn't ready yet — could hang its Dart caller
+/// indefinitely, wedging the reconnect orchestration. The Dart layer also bounds
+/// the reconnect body, but this guarantees no native call hangs forever
+/// regardless of which caller invokes it.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// JWT claims structure for extracting expiration time.
 #[derive(Deserialize)]
 struct JwtClaims {
@@ -212,7 +225,10 @@ impl QuerySubscriber for CallbackSubscriberDartFn {
 /// Main Convex client struct, opaque to Dart, managing connections and operations.
 #[frb(opaque)]
 pub struct MobileConvexClient {
-    deployment_url: String,      // URL of the Convex deployment
+    // Interior-mutable so the in-app deployment switcher (W5) can repoint a live
+    // client at a different deployment via `set_deployment_url`. parking_lot
+    // Mutex (already used for `state_change_sender`) — reads are brief clones.
+    deployment_url: Mutex<String>, // URL of the Convex deployment
     client_id: String,           // Client ID for authentication
     // Swappable inner client so we can force a full reconnect (drop + re-init)
     // on app resume after iOS suspension. tokio::sync::Mutex because init is
@@ -233,7 +249,7 @@ impl MobileConvexClient {
             .build()
             .unwrap();
         MobileConvexClient {
-            deployment_url,
+            deployment_url: Mutex::new(deployment_url),
             client_id,
             client: tokio::sync::Mutex::new(None),
             rt,
@@ -301,7 +317,7 @@ impl MobileConvexClient {
             return Ok(client.clone());
         }
 
-        let url = self.deployment_url.clone();
+        let url = self.deployment_url.lock().clone();
         let state_sender = self.state_change_sender.lock().clone();
         let client_id = self.client_id.to_owned();
 
@@ -348,6 +364,28 @@ impl MobileConvexClient {
         Ok(())
     }
 
+    /// Repoints this client at a different deployment URL and drops the inner
+    /// client so the next operation builds a fresh WebSocket against the new
+    /// deployment. This is the native primitive behind the in-app deployment
+    /// switcher (W5): the same `MobileConvexClient` instance, tokio runtime, and
+    /// websocket-state channel are kept alive; only the inner Convex client is
+    /// recreated against the new address (the URL is immutable inside the Convex
+    /// SDK, so swapping deployments requires a transport rebuild).
+    ///
+    /// Like [`force_reconnect`], callers (Dart side) must replay auth via
+    /// [`set_auth_with_refresh`] and re-fire any active subscriptions afterwards
+    /// — the previous [`AuthHandle`]/[`SubscriptionHandle`] values point at the
+    /// dropped client. Auth tokens validate across deployments that share an
+    /// issuer, so no re-login is needed when switching among them.
+    #[frb]
+    pub async fn set_deployment_url(&self, url: String) -> Result<(), ClientError> {
+        debug!("set_deployment_url: switching deployment to {}", url);
+        *self.deployment_url.lock() = url;
+        let mut guard = self.client.lock().await;
+        *guard = None;
+        Ok(())
+    }
+
     /// Executes a query on the Convex backend.
     #[frb]
     pub async fn query(
@@ -389,9 +427,25 @@ impl MobileConvexClient {
     ) -> anyhow::Result<SubscriptionHandle> {
         let mut client = self.connected_client().await?;
         debug!("New subscription");
-        let mut subscription = client
-            .subscribe(name.as_str(), parse_json_args(args))
-            .await?;
+        // Bound the Subscribe flush: the SDK worker parks until the socket is
+        // connected, so without this a subscribe on a dead/connecting socket
+        // (e.g. during a resume reconnect on iOS) would hang the FFI caller
+        // forever. See [`SUBSCRIBE_TIMEOUT`].
+        let mut subscription = match tokio::time::timeout(
+            SUBSCRIBE_TIMEOUT,
+            client.subscribe(name.as_str(), parse_json_args(args)),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "subscribe '{}' timed out after {:?} (socket not connected)",
+                    name,
+                    SUBSCRIBE_TIMEOUT
+                ));
+            }
+        };
         let (cancel_sender, cancel_receiver) = oneshot::channel::<()>();
         self.rt.spawn(async move {
             let cancel_fut = cancel_receiver.fuse();

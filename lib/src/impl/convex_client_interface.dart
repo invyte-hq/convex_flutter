@@ -150,10 +150,22 @@ abstract class IConvexClient {
   @Deprecated('Use connectionState stream instead')
   Future<ConnectionStatus> checkConnection();
 
-  /// Manually triggers a reconnection attempt.
+  /// Rebuilds the transport, replays auth, and re-fires every active
+  /// subscription.
   ///
-  /// Returns `true` if reconnection was successful, `false` otherwise.
-  Future<bool> reconnect();
+  /// [url] — when non-null, switches the live client to a *different* deployment
+  /// (the in-app deployment switcher); when null, reconnects to the current
+  /// deployment (the resume-recovery path). Subscriptions and the consumer's
+  /// stable handles survive across the reconnect; only the underlying transport
+  /// is swapped.
+  ///
+  /// Returns a best-effort, transport-dependent success flag: on native, `true`
+  /// once auth was replayed and every subscription re-fired without error; on
+  /// web, `true` once the new socket reached the open state. Treat it as
+  /// advisory — observe [connectionState] (and your subscriptions) for
+  /// authoritative status, since "connected" and the first post-reconnect data
+  /// still arrive asynchronously.
+  Future<bool> reconnect({String? url});
 
   // ============================================================================
   // Lifecycle Management

@@ -83,6 +83,34 @@ callback (different layers, different audiences).
   raises Rust MSRV to 1.85; pulls in `imbl` 7.0 (major bump) and new
   transitives `safe_arch` + `wide`.
 
+### Bounded `subscribe` — no FFI call can hang the Dart layer forever
+
+**lib.rs** — `internal_subscribe` wraps the inner `client.subscribe(...).await`
+in `tokio::time::timeout(SUBSCRIBE_TIMEOUT, …)` (30s).
+
+The Convex SDK worker only acks a `Subscribe` after `communicate()` flushes it
+to a *connected* socket (`client/worker.rs`); `build()`/`set_auth` return
+immediately, but `subscribe` does **not**. On a dead-or-connecting socket — e.g.
+a subscribe fired during the resume-reconnect while iOS hasn't restored the
+network — that flush parks indefinitely, which used to wedge the Dart reconnect
+orchestration. Bounding it guarantees the FFI call always returns. A timed-out
+subscribe self-cleans: the worker still builds the `QuerySubscription` and its
+`Drop` sends `Unsubscribe`, so no half-registered query leaks (and the whole
+client is dropped on the next reconnect regardless).
+
+### Mutable deployment URL + `set_deployment_url` (in-app deployment switcher)
+
+**lib.rs** — `MobileConvexClient::deployment_url` changed from `String` to
+`parking_lot::Mutex<String>` (the lock is already imported for
+`state_change_sender`); `connected_client` reads it via a brief `lock().clone()`.
+New `set_deployment_url(url)` writes the new URL and drops the inner client, so
+the next operation builds a fresh transport against the new deployment — the same
+`MobileConvexClient`, tokio runtime and ws-state channel are kept alive. The URL
+is immutable inside the Convex SDK, so switching deployments on a live client
+requires this transport rebuild. Backs the W5 dev-only deployment switcher (see
+the Dart `reconnect({url})` below). No lock is held across an `.await` (the
+parking_lot guard is dropped before the `client.lock().await`).
+
 ## Dart layer (`lib/src/`)
 
 ### Structured logging via `ConvexLogger`
@@ -205,3 +233,58 @@ sign-in.
 
 `finally` guarantees the completer resolves even if `tokenFetcher` throws
 or returns `null` (sign-out path), so subscribes never hang.
+
+### Robust resume-reconnect (iOS background recovery)
+
+**lib/src/impl/convex_client_native.dart** — the resume-recovery path was
+rewritten to fix an iOS bug where Convex subscriptions never resumed after the
+app returned from background.
+
+Root cause: the previous `reconnect()` held its re-entrancy guard
+(`_reconnectInProgress`) across the whole async body with **no timeout**. The
+re-subscribe step awaits `subscribe`, which parks until the new socket connects
+(see *Bounded `subscribe`* above). If the app re-backgrounded mid-connect —
+freezing the tokio runtime and killing the in-flight connection — that await
+never completed, the guard latched forever, and every subsequent `resumed`
+no-op'd; subscriptions stayed dead until the process was killed.
+
+The rewrite:
+
+- **Guard can't latch.** `reconnect()` is single-flight; the body
+  (`_performReconnect`) is bounded by `_reconnectTimeout` (20s), so the guard is
+  always released. Calls arriving mid-reconnect are **coalesced** (a URL switch
+  wins over a plain resume), and a timed-out body is **generation**-tagged so a
+  late orphan can't clobber a newer attempt's auth/subscription handles.
+- **Lifecycle edge, not wall-clock.** The trigger is now "a real background
+  (`paused`/`detached`) occurred since the last `resumed`", replacing the old
+  `_lastServerActivity` + 10s staleness heuristic (which keyed off app traffic,
+  not socket liveness — it both false-negatived a dead-but-recently-active
+  socket and churned healthy ones). A mere `inactive` peek no longer reconnects.
+- **Auth before subscribe.** Reconnect pushes the initial token via `setAuth`
+  *before* re-subscribing, so `Authenticate` is enqueued on the worker's FIFO
+  ahead of the re-`Subscribe`s — removing a `NOT_AUTHENTICATED` flash and
+  matching the web transport's `onopen` ordering.
+- **Self-healing.** A failed/timed-out attempt schedules a bounded retry, and a
+  subscription stranded by a transient outage (`needsRestore`) is restored when
+  the socket next reaches `connected`.
+
+### `reconnect({String? url})` — in-app deployment switcher (W5)
+
+**convex_client_interface.dart / convex_client.dart / both impls** — `reconnect`
+gains an optional `url`. With `url`, the live client is repointed at a different
+deployment (native via `set_deployment_url`, web via the mutable
+`_activeDeploymentUrl`) and auth + subscriptions are replayed against it; without
+it, it's the same-deployment resume reconnect. Auth tokens validate across
+deployments sharing a Clerk issuer, so no re-login is needed. The facade's
+`reconnect` doc — which previously (and wrongly) claimed it called
+`checkConnection` — was corrected.
+
+### Web: mutable deployment URL + deliberate-close guard
+
+**lib/src/impl/convex_client_web.dart** — `_connect()` reads a mutable
+`_activeDeploymentUrl` (seeded from the config) so `reconnect(url:)` can switch
+deployments; on a switch the message queue is cleared so stale messages don't
+flush against the new session. `reconnect()` now **detaches the old socket's
+handlers before closing it**, fixing a latent double-connect: the superseded
+socket's `onclose` used to fire `_scheduleReconnect()`, racing the explicit
+`_connect()`.
