@@ -45,7 +45,7 @@ jobs:
     name: iOS (device + simulator)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dart-lang/setup-dart@v1
       - name: Precompile iOS binaries
         working-directory: cargokit/build_tool
@@ -65,7 +65,7 @@ jobs:
     name: Android (arm64, armv7, x86_64, x86)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dart-lang/setup-dart@v1
       - name: Install Android NDK ${{ env.ANDROID_NDK_VERSION }}
         run: |

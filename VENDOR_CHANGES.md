@@ -12,16 +12,22 @@ Upstreaming is not a goal.
 
 ## Cargokit (`cargokit/`)
 
-### Skip debug x86 + x86_64 force-add on Android
+### Debug x86_64 force-add on Android (restored, trimmed to 64-bit)
 
 **cargokit/gradle/plugin.gradle** — upstream mirrors `flutter.gradle` by
-force-adding `android-x86` and `android-x64` to the debug target list, so
-`cargo build` runs for three architectures even when the connected device is
-arm64. Invyte ships arm64-v8a only (see `app/android/app/build.gradle.kts`
-`ndk.abiFilters`), and dev/test happens on physical arm64 devices via the
-WSL2→Windows ADB bridge. The extra cross-compiles added ~60–90s per debug
-iteration. The block is replaced with a comment; to re-enable emulator builds,
-restore the upstream lines or pass `--target-platform=android-x64`.
+force-adding `android-x86` and `android-x64` to the debug target list so the app
+runs on emulators. This was previously removed: Invyte ships arm64-v8a only and
+each extra ABI cost ~60–90s of Rust *cross-compile* per debug iteration.
+
+With [precompiled binaries](../PRECOMPILED_BINARIES.md) that cost is gone — the
+emulator ABI is now a fast signed download, not a `cargo build`. The force-add is
+therefore restored, trimmed to **`android-x64` only** (modern emulator system
+images are 64-bit; 32-bit `android-x86` is intentionally omitted) and guarded
+against duplicating an ABI Flutter already targets.
+
+Note this only controls which ABIs a *debug build* fetches; what ships in the APK
+is still gated by the app's `ndk.abiFilters`. For emulator support the app's
+debug `abiFilters` must include `x86_64`.
 
 ## Rust client (`rust/`)
 
