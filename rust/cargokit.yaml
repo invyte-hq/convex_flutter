@@ -1,0 +1,15 @@
+# Cargokit precompiled-binaries configuration.
+#
+# When this file is present, consumers of the convex_flutter plugin can download
+# pre-built, signed native libraries instead of compiling the Rust crate from
+# source on every `flutter build`. See PRECOMPILED_BINARIES.md for the full setup.
+#
+# - url_prefix: where signed artifacts are downloaded from. Cargokit appends
+#     "<crate-hash>/<file>" to this prefix. The release tag created by CI is
+#     "precompiled_<crate-hash>", which is why the prefix ends with "precompiled_".
+# - public_key: ed25519 public key used to verify the signature of every
+#     downloaded artifact. The matching private key lives ONLY in the
+#     repository's PRIVATE_KEY GitHub Actions secret.
+precompiled_binaries:
+  url_prefix: https://github.com/invyte-hq/convex_flutter/releases/download/precompiled_
+  public_key: ed143da0226ce16cfa1517f3d1a428534ffb93e11bb15f5559c8e816719b4720
