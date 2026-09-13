@@ -128,13 +128,14 @@ class WebConvexClient implements IConvexClient {
 
   /// Tracks an in-flight initial auth setup: set on entry to
   /// [setAuthWithRefresh] and completed after the first `setAuth(token)` has
-  /// been pushed to the WS, then nulled out. Steady-state subscribes pay
+  /// been pushed to the WS, then nulled out. Steady-state calls pay
   /// nothing — `await null?.future` is a no-op.
   ///
-  /// During initial auth, [subscribe] awaits this future so the server
-  /// processes Authenticate before the Subscribe message. Without it,
-  /// subscribes that race the bridge's setAuthWithRefresh land at the server
-  /// unauthenticated and fail with NOT_AUTHENTICATED on auth-required queries.
+  /// During initial auth, [subscribe], [query], [mutation] and [action] await
+  /// this future so the server processes Authenticate before anything they
+  /// send. Without it, calls that race the bridge's setAuthWithRefresh land at
+  /// the server unauthenticated and fail with NOT_AUTHENTICATED on
+  /// auth-required functions.
   ///
   /// Only the *first* setAuth roundtrip is gated; subsequent refresh-loop
   /// rotations don't toggle this (the old token is valid until the new one
@@ -855,6 +856,10 @@ class WebConvexClient implements IConvexClient {
 
   @override
   Future<String> query(String name, Map<String, dynamic> args) async {
+    // Same gate as [subscribe]: a one-shot issued during initial auth setup
+    // must not reach the server ahead of the first Authenticate.
+    await _authInFlight?.future;
+
     // Queries in Convex protocol use ModifyQuerySet (like subscriptions)
     // We subscribe, wait for first result, then unsubscribe
     final queryId = _queryIdCounter++;
@@ -917,6 +922,8 @@ class WebConvexClient implements IConvexClient {
     required String name,
     required Map<String, dynamic> args,
   }) async {
+    await _authInFlight?.future;
+
     final requestId = _generateMessageId();
     final completer = Completer<String>();
     _pendingRequests[requestId] = completer;
@@ -948,6 +955,8 @@ class WebConvexClient implements IConvexClient {
     required String name,
     required Map<String, dynamic> args,
   }) async {
+    await _authInFlight?.future;
+
     final requestId = _generateMessageId();
     final completer = Completer<String>();
     _pendingRequests[requestId] = completer;

@@ -209,30 +209,49 @@ straightforward protocol-correctness fixes:
 from the public `_authStateController` so programmatic state changes
 don't trigger spurious refreshes).
 
-### Buffer Subscribe messages during initial auth setup (both transports)
+### Hold every call during initial auth setup (both transports)
 
 `setAuthWithRefresh` opens a `Completer<void>? _authInFlight` on entry and
-completes it once the first `setAuth(token)` has been pushed to the WS.
-`subscribe` awaits this completer before issuing its `ModifyQuerySet`
-(web) / `_rustClient.subscribe` (native) call.
+completes it once the first token is on the socket. `subscribe`, `query`,
+`mutation` and `action` await this completer before they send anything, so
+nothing a caller issues while the first token is minted can reach the server
+ahead of the `Authenticate`.
 
-The race this fixes: callers commonly start subscribing the moment Clerk
-(or another external auth source) reports signed-in, which kicks off
-`setAuthWithRefresh` in parallel. Without the gate, Subscribe messages
-reach the server before the `Authenticate` does, and the server runs
-auth-required queries unauthenticated — yielding `NOT_AUTHENTICATED`
-errors that are only papered over by the resubscribe-after-auth path.
+The race this fixes: callers commonly start subscribing, and firing the
+mutations a sign-in triggers, the moment Clerk (or another external auth
+source) reports signed-in, which kicks off `setAuthWithRefresh` in parallel.
+Without the gate those messages reach the server before the `Authenticate`
+does, and the server runs auth-required functions unauthenticated:
+`NOT_AUTHENTICATED` errors that a resubscribe or a retry after the token
+then papers over.
+
+What "the first token is on the socket" means per transport:
+
+- **Web** awaits its own `refresh()`: `tokenFetcher()`, then `setAuth`, which
+  sends or queues the `Authenticate` on the Dart-owned WebSocket FIFO.
+- **Native** cannot await the FFI call for this: `set_auth_with_refresh` in
+  `rust/src/lib.rs` spawns the whole refresh loop, first fetch and first
+  `set_auth` included, and returns the `AuthHandle` at once. The wrapper's
+  `_startRefreshLoop` therefore waits for the loop's first pass to report
+  back: `on_auth_change(true)`, which Rust fires after that `set_auth`
+  returned, or a `null` from the fetcher, on which the loop clears auth and
+  ends. Only then does `setAuthWithRefresh` return and the gate open. A
+  fetcher that throws is logged and counts as `null` (the generated bridge
+  panics the Rust task on a Dart exception, which would kill the loop
+  without a trace). `test/native_auth_gate_test.dart` pins this against a
+  fake Rust client with the real timing.
 
 The gate has zero cost outside of initial auth (`_authInFlight` is `null`,
 so `await null?.future` is a no-op). It does **not** fire on subsequent
-refresh-loop rotations — the old token remains valid until the new one
-lands, so subscribes never see an unauthenticated WS during a refresh.
-Public-query subscribes during initial auth pay one extra token-roundtrip
-of latency, which is invisible to users and only happens once per
-sign-in.
+refresh-loop rotations: the old token remains valid until the new one
+lands. Public-function calls during initial auth pay one token round trip
+of latency, once per sign-in.
 
-`finally` guarantees the completer resolves even if `tokenFetcher` throws
-or returns `null` (sign-out path), so subscribes never hang.
+`finally` guarantees the completer resolves even if the transport throws or
+the fetcher yields `null` (sign-out path), so no call hangs.
+
+The reconnect path (below) uses the same `_startRefreshLoop`, which is what
+lets it re-subscribe behind a single `Authenticate`.
 
 ### Robust resume-reconnect (iOS background recovery)
 
@@ -260,10 +279,13 @@ The rewrite:
   `_lastServerActivity` + 10s staleness heuristic (which keyed off app traffic,
   not socket liveness — it both false-negatived a dead-but-recently-active
   socket and churned healthy ones). A mere `inactive` peek no longer reconnects.
-- **Auth before subscribe.** Reconnect pushes the initial token via `setAuth`
-  *before* re-subscribing, so `Authenticate` is enqueued on the worker's FIFO
-  ahead of the re-`Subscribe`s — removing a `NOT_AUTHENTICATED` flash and
-  matching the web transport's `onopen` ordering.
+- **Auth before subscribe.** Reconnect starts the refresh loop through
+  `_startRefreshLoop` and waits for its first token push before
+  re-subscribing, so `Authenticate` is on the worker's FIFO ahead of the
+  re-`Subscribe`s: one fetch, one `Authenticate`, no `NOT_AUTHENTICATED`
+  flash, matching the web transport's `onopen` ordering. (It used to push a
+  token via `setAuth` first and then start the loop, which fetched and sent
+  a second one.)
 - **Self-healing.** A failed/timed-out attempt schedules a bounded retry, and a
   subscription stranded by a transient outage (`needsRestore`) is restored when
   the socket next reaches `connected`.

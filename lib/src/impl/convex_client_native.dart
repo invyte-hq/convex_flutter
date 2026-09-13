@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
 import 'package:convex_flutter/src/rust/lib.dart';
 import 'package:convex_flutter/src/rust/frb_generated.dart';
@@ -77,13 +79,15 @@ class NativeConvexClient implements IConvexClient {
 
   /// Tracks an in-flight initial auth setup: set on entry to
   /// [setAuthWithRefresh] and completed after the Rust SDK pushes the first
-  /// token to the WS, then nulled out. Steady-state subscribes pay nothing —
+  /// token to the WS (see [_startRefreshLoop]; the FFI call itself returns
+  /// before that), then nulled out. Steady-state calls pay nothing —
   /// `await null?.future` is a no-op.
   ///
-  /// During initial auth, [subscribe] awaits this future so the server
-  /// processes Authenticate before the Subscribe message. Without it,
-  /// subscribes that race the caller's setAuthWithRefresh land at the server
-  /// unauthenticated and fail with NOT_AUTHENTICATED on auth-required queries.
+  /// During initial auth, [subscribe], [query], [mutation] and [action] await
+  /// this future so the server processes Authenticate before anything they
+  /// send. Without it, calls that race the caller's setAuthWithRefresh land at
+  /// the server unauthenticated and fail with NOT_AUTHENTICATED on
+  /// auth-required functions.
   ///
   /// Only the *first* setAuth roundtrip is gated; subsequent refresh-loop
   /// rotations (handled inside the Rust SDK) don't toggle this.
@@ -141,6 +145,17 @@ class NativeConvexClient implements IConvexClient {
       verboseLogging: config.verboseNativeLogs,
     );
 
+    return wire(rustClient, config);
+  }
+
+  /// Wraps an already-built [rustClient]: everything [create] does after the
+  /// bridge is initialised (the WS state listener, the lifecycle observer).
+  /// Tests hand in a fake [MobileConvexClient] here.
+  @visibleForTesting
+  static Future<NativeConvexClient> wire(
+    MobileConvexClient rustClient,
+    ConvexConfig config,
+  ) async {
     // Create native client wrapper
     final client = NativeConvexClient._(rustClient, config);
 
@@ -221,6 +236,10 @@ class NativeConvexClient implements IConvexClient {
 
   @override
   Future<String> query(String name, Map<String, dynamic> args) async {
+    // Same gate as [subscribe]: a one-shot issued during initial auth setup
+    // must not reach the server ahead of the first Authenticate.
+    await _authInFlight?.future;
+
     final formattedArgs = buildArgs(args);
     final result = await _rustClient
         .query(name: name, args: formattedArgs)
@@ -233,6 +252,8 @@ class NativeConvexClient implements IConvexClient {
     required String name,
     required Map<String, dynamic> args,
   }) async {
+    await _authInFlight?.future;
+
     final formattedArgs = buildArgs(args);
     final result = await _rustClient
         .mutation(name: name, args: formattedArgs)
@@ -245,6 +266,8 @@ class NativeConvexClient implements IConvexClient {
     required String name,
     required Map<String, dynamic> args,
   }) async {
+    await _authInFlight?.future;
+
     final formattedArgs = buildArgs(args);
     final result = await _rustClient
         .action(name: name, args: formattedArgs)
@@ -368,8 +391,8 @@ class NativeConvexClient implements IConvexClient {
     _lastTokenFetcher = tokenFetcher;
     _lastOnAuthChange = onAuthChange;
 
-    // Open the in-flight gate so subscribes issued before the first
-    // `setAuth(token)` returns from the WS wait for Authenticate to land.
+    // Open the in-flight gate so calls issued before the first token is on
+    // the socket wait for Authenticate to land.
     // Defensive: if a previous call left one open (caller didn't dispose),
     // complete it so existing waiters proceed against the new auth setup.
     final completer = Completer<void>();
@@ -379,12 +402,12 @@ class NativeConvexClient implements IConvexClient {
     // The Rust SDK manages the JWT-aware refresh loop and only fires
     // on_auth_change on transitions — which matches our public contract.
     // Use try/finally so the in-flight gate is always released, even if
-    // the Rust side throws — otherwise subscribes waiting on the completer
+    // the Rust side throws — otherwise calls waiting on the completer
     // would hang forever.
     try {
-      final handle = await _rustClient.setAuthWithRefresh(
-        fetchToken: () async => await tokenFetcher(),
-        onAuthChange: (bool isAuth) async {
+      final handle = await _startRefreshLoop(
+        tokenFetcher: tokenFetcher,
+        onAuthChange: (isAuth) {
           onAuthChange?.call(isAuth);
           _emitAuthState(isAuth);
         },
@@ -396,6 +419,51 @@ class NativeConvexClient implements IConvexClient {
       if (!completer.isCompleted) completer.complete();
       if (identical(_authInFlight, completer)) _authInFlight = null;
     }
+  }
+
+  /// Starts the Rust refresh loop and returns its handle once the loop's first
+  /// pass has run: the initial token was pushed to the socket (`onAuthChange`
+  /// fired, which Rust does after that `set_auth` returned), or [tokenFetcher]
+  /// yielded no token and the loop cleared auth and ended. The FFI call itself
+  /// returns as soon as the loop is spawned, before any token exists, so this
+  /// wait is the only way to know the first Authenticate is on the worker's
+  /// FIFO ahead of whatever the caller sends next.
+  ///
+  /// A [tokenFetcher] that throws is logged and counts as no token: the
+  /// generated bridge panics the Rust task on a Dart exception, which would
+  /// kill the loop without a trace.
+  Future<AuthHandle> _startRefreshLoop({
+    required Future<String?> Function() tokenFetcher,
+    required void Function(bool isAuthenticated) onAuthChange,
+  }) async {
+    final firstPass = Completer<void>();
+    void settle() {
+      if (!firstPass.isCompleted) firstPass.complete();
+    }
+
+    final handle = await _rustClient.setAuthWithRefresh(
+      fetchToken: () async {
+        String? token;
+        try {
+          token = await tokenFetcher();
+        } catch (e, st) {
+          config.logger(
+            ConvexLogLevel.error,
+            'native',
+            'tokenFetcher threw: $e\n$st',
+          );
+        }
+        // No token: the Rust loop clears auth and exits without a callback.
+        if (token == null) settle();
+        return token;
+      },
+      onAuthChange: (bool isAuth) async {
+        settle();
+        onAuthChange(isAuth);
+      },
+    );
+    await firstPass.future;
+    return handle;
   }
 
   @override
@@ -572,40 +640,17 @@ class NativeConvexClient implements IConvexClient {
     }
     if (gen != _reconnectGeneration) return false;
 
-    // 4) Replay auth BEFORE re-subscribing. Push the initial token directly via
-    //    setAuth first so Authenticate is enqueued on the worker's FIFO ahead of
-    //    the re-Subscribes below — without this, re-Subscribes can reach the
-    //    server before Authenticate and briefly fail auth-required queries
-    //    (NOT_AUTHENTICATED). Then start the refresh loop for ongoing rotation.
-    //    Skip entirely if the consumer never used refresh-based auth (they own
-    //    their setAuth).
-    //
-    //    NOTE: the refresh loop's own first push (a second Authenticate) may
-    //    trail the re-Subscribes — that's intentionally benign. The server
-    //    treats a re-sent valid token at a higher monotonic identity version as
-    //    a legitimate update, not an AuthError. Don't try to "fix" it by
-    //    awaiting the loop's first push: that push happens inside the spawned
-    //    Rust task and isn't awaitable from here — which is exactly why the
-    //    explicit setAuth above is what guarantees the ordering.
+    // 4) Replay auth BEFORE re-subscribing. [_startRefreshLoop] returns once
+    //    the loop's first token is on the worker's FIFO, so every re-Subscribe
+    //    below queues behind that Authenticate: one fetch, one Authenticate,
+    //    no NOT_AUTHENTICATED flash. Skip entirely if the consumer never used
+    //    refresh-based auth (they own their setAuth). A throw from the FFI
+    //    lands in [reconnect]'s catch, which fails the attempt and schedules
+    //    the bounded retry.
     if (authFetcher != null) {
-      String? initialToken;
-      try {
-        initialToken = await authFetcher();
-      } catch (e) {
-        config.logger(
-          ConvexLogLevel.warn,
-          'native',
-          'Token fetch during reconnect threw: $e',
-        );
-        initialToken = null;
-      }
-      if (gen != _reconnectGeneration) return false;
-
-      await _rustClient.setAuth(token: initialToken);
-
-      final handle = await _rustClient.setAuthWithRefresh(
-        fetchToken: () async => await authFetcher(),
-        onAuthChange: (bool isAuth) async {
+      final handle = await _startRefreshLoop(
+        tokenFetcher: authFetcher,
+        onAuthChange: (isAuth) {
           authOnChange?.call(isAuth);
           _emitAuthState(isAuth);
         },

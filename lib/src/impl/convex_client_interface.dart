@@ -106,6 +106,15 @@ abstract class IConvexClient {
   /// [onAuthChange] fires on auth state **transitions** only (unauthenticated
   /// → authenticated, and vice versa) — not on every refresh.
   ///
+  /// Returns once the initial token has reached the transport: on web after
+  /// the first `Authenticate` was sent or queued, on native after the Rust
+  /// refresh loop's first `set_auth`. Until then [subscribe], [query],
+  /// [mutation] and [action] wait, so nothing the caller sends afterwards
+  /// can overtake that `Authenticate`. A [tokenFetcher] that yields `null`
+  /// releases them at once, unauthenticated. [tokenFetcher] should return
+  /// `null` rather than throw when no token can be minted; a throw is logged
+  /// and counts as no token for that pass.
+  ///
   /// Returns an [AuthHandle] that owns the refresh timer; call `dispose()`
   /// to stop refreshes and clear auth.
   Future<AuthHandle> setAuthWithRefresh({
