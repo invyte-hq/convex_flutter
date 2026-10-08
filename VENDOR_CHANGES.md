@@ -184,7 +184,10 @@ straightforward protocol-correctness fixes:
 - `_handle{Mutation,Action}Response`: check `success` flag before treating
   `null` result as an error (void-returning functions return `null`
   legitimately); emit `ClientError` (`convexError` / `serverError`)
-  instead of generic `Exception`, matching native FFI error types.
+  instead of generic `Exception`, matching native FFI error types. The
+  `ConvexError` payload is read from the response's sibling `errorData`
+  field, not from `result` (the message string), in
+  `lib/src/impl/web_failed_response.dart`.
 - `_handleTransition`: deliver `null` `QueryUpdated` values to subscribers
   (e.g. a query returning `null` for an unauthenticated user); parse and
   forward subscription error fields (`errorMessage` / `error_message` /

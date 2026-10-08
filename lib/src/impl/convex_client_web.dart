@@ -6,8 +6,9 @@
 //   - setAuth: pass null (not '') on sign-out so tokenType:"None" is sent
 //   - _handleMutationResponse / _handleActionResponse: check success flag before
 //     treating null result as error (void-returning functions return null)
-//   - _handleMutationResponse / _handleActionResponse: emit ClientError
-//     (convexError / serverError) — matches native FFI error types
+//   - _handleMutationResponse / _handleActionResponse: emit ClientError from
+//     the response's result and sibling errorData (convexError when errorData
+//     is present, serverError otherwise) — matches native FFI error types
 //   - _sendAuthMessage: separate _identityVersion counter (not _querySetVersion)
 //   - _handleTransition: deliver null QueryUpdated values to subscribers
 //   - _handleTransition: parse and forward subscription errors (errorMessage /
@@ -40,8 +41,9 @@ import 'dart:math' as math;
 
 import 'package:web/web.dart' as web;
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
+import 'package:convex_flutter/src/impl/web_failed_response.dart';
 import 'package:convex_flutter/src/rust/lib.dart'
-    show AuthHandle, ClientError, SubscriptionHandle, WebSocketConnectionState;
+    show AuthHandle, SubscriptionHandle, WebSocketConnectionState;
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/convex_logger.dart';
@@ -576,7 +578,7 @@ class WebConvexClient implements IConvexClient {
     final success = message['success'] as bool? ?? false;
     final result = message['result'];
     if (!success) {
-      completer.completeError(_buildClientError(result, 'Mutation failed'));
+      completer.completeError(failedResponseError(message, 'Mutation failed'));
     } else {
       completer.complete(result != null ? jsonEncode(result) : 'null');
     }
@@ -593,26 +595,10 @@ class WebConvexClient implements IConvexClient {
     final success = message['success'] as bool? ?? false;
     final result = message['result'];
     if (!success) {
-      completer.completeError(_buildClientError(result, 'Action failed'));
+      completer.completeError(failedResponseError(message, 'Action failed'));
     } else {
       completer.complete(result != null ? jsonEncode(result) : 'null');
     }
-  }
-
-  /// Builds a [ClientError] from an error response, matching the native FFI
-  /// client's error types.
-  ///
-  /// If `errorData` is present (from a Convex `ConvexError`), emits
-  /// [ClientError.convexError]. Otherwise emits [ClientError.serverError].
-  ClientError _buildClientError(dynamic result, String fallback) {
-    final errorData = result is Map ? result['data'] : null;
-    if (errorData != null) {
-      return ClientError.convexError(data: jsonEncode(errorData));
-    }
-    final message = result is Map
-        ? (result['message']?.toString() ?? fallback)
-        : (result?.toString() ?? fallback);
-    return ClientError.serverError(msg: message);
   }
 
   /// Handles FatalError messages.
