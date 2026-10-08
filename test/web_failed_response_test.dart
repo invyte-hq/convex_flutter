@@ -30,6 +30,20 @@ void main() {
     expect(error, ClientError.convexError(data: jsonEncode(payload)));
   });
 
+  test('a production response, its message redacted, still carries the '
+      'payload', () {
+    final error = failedResponseError(<String, dynamic>{
+      'type': 'MutationResponse',
+      'requestId': 3,
+      'success': false,
+      'result': '[Request ID: 5f3c0a1d2b9e4c7f] Server Error',
+      'logLines': <String>[],
+      'errorData': payload,
+    }, 'Mutation failed');
+
+    expect(error, ClientError.convexError(data: jsonEncode(payload)));
+  });
+
   test('a failed action with errorData becomes convexError', () {
     final error = failedResponseError(<String, dynamic>{
       'type': 'ActionResponse',
