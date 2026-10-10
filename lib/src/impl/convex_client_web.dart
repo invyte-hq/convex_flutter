@@ -864,7 +864,7 @@ class WebConvexClient implements IConvexClient {
       },
       onError: (message, value) {
         if (!completer.isCompleted) {
-          completer.completeError(Exception(message));
+          completer.completeError(transitionError(message, value));
           _subscriptions.remove(queryIdStr);
         }
       },
