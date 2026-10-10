@@ -22,3 +22,13 @@ ClientError failedResponseError(Map<String, dynamic> message, String fallback) {
     msg: message['result']?.toString() ?? fallback,
   );
 }
+
+/// The [ClientError] for a Transition that failed a one-shot query, from the
+/// `(message, data)` pair the subscription path extracts. A one-shot query is a
+/// temporary subscription, so its error arrives in a live subscription's shape
+/// and must become the same [ClientError] a failed mutation does: the payload
+/// when the function threw a ConvexError, else the bare message.
+ClientError transitionError(String message, String? data) {
+  if (data != null) return ClientError.convexError(data: data);
+  return ClientError.serverError(msg: message);
+}

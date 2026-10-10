@@ -70,4 +70,28 @@ void main() {
 
     expect(error, const ClientError.serverError(msg: 'Server Error'));
   });
+
+  test('a one-shot query refused with a payload becomes convexError, as a '
+      'mutation does', () {
+    final error = transitionError(thrown, jsonEncode(payload));
+
+    expect(error, ClientError.convexError(data: jsonEncode(payload)));
+  });
+
+  test(
+    'a one-shot query that failed without a payload becomes serverError',
+    () {
+      final error = transitionError(
+        '[Request ID: 5f3c0a1d2b9e4c7f] Server Error',
+        null,
+      );
+
+      expect(
+        error,
+        const ClientError.serverError(
+          msg: '[Request ID: 5f3c0a1d2b9e4c7f] Server Error',
+        ),
+      );
+    },
+  );
 }
