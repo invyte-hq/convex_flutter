@@ -305,9 +305,21 @@ class NativeConvexClient implements IConvexClient {
         onUpdate: (value) => _dispatchOnUpdate(tracked, value),
         onError: (message, value) => _dispatchOnError(tracked, message, value),
       );
-    } catch (e) {
-      _activeSubs.remove(id);
-      rethrow;
+    } catch (e, st) {
+      // A throw while the socket is down is stranded for the next `connected`
+      // to replay, as a reconnect's is. One while connected is final: replaying
+      // a sub that can never succeed would force reconnect after reconnect.
+      if (_currentConnectionState == WebSocketConnectionState.connected) {
+        _activeSubs.remove(id);
+        rethrow;
+      }
+      tracked.needsRestore = true;
+      config.logger(
+        ConvexLogLevel.error,
+        'native',
+        'Subscribe "$name" failed; stranded until the socket connects: $e\n$st',
+      );
+      _dispatchOnError(tracked, e.toString(), null);
     }
 
     return _NativeSubscriptionHandle(onCancel: () => _cancelTracked(id));
@@ -729,11 +741,12 @@ class NativeConvexClient implements IConvexClient {
     });
   }
 
-  /// Restores subscriptions stranded by a prior reconnect whose re-subscribe
-  /// failed while the socket was down (e.g. the network only returned after the
-  /// bounded retries were exhausted). The freshly-`connected` socket is the
-  /// trigger: re-run reconnect to re-fire the still-stranded subs. Keyed off the
-  /// explicit [_TrackedSubscription.needsRestore] flag, NOT a null handle —
+  /// Restores subscriptions stranded by a first subscribe, or a prior
+  /// reconnect's re-subscribe, that failed while the socket was down (e.g. the
+  /// network only returned after the bounded retries were exhausted). The
+  /// freshly-`connected` socket is the trigger: re-run reconnect to re-fire the
+  /// still-stranded subs. Keyed off the explicit
+  /// [_TrackedSubscription.needsRestore] flag, NOT a null handle —
   /// handles are also transiently null during a normal initial subscribe, which
   /// must not provoke a reconnect. Skipped mid-reconnect (the single-flight
   /// coalesce would queue it anyway; skipping avoids needless churn).
@@ -819,8 +832,9 @@ class _TrackedSubscription {
   SubscriptionHandle? currentHandle;
   bool canceled = false;
 
-  /// Set when a reconnect's re-subscribe for this sub failed (socket down), so
-  /// it's known to need restoring once the socket is back — see
+  /// Set when a reconnect's re-subscribe for this sub failed, or its first
+  /// subscribe did (socket down), so it's known to need restoring once the
+  /// socket is back — see
   /// [NativeConvexClient._restoreOrphanedSubscriptionsIfAny]. Distinct from a
   /// transiently-null [currentHandle] during a normal initial subscribe.
   bool needsRestore = false;
