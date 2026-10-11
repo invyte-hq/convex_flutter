@@ -42,8 +42,9 @@ import 'dart:math' as math;
 import 'package:web/web.dart' as web;
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
 import 'package:convex_flutter/src/impl/web_failed_response.dart';
+import 'package:convex_flutter/src/impl/web_pending_requests.dart';
 import 'package:convex_flutter/src/rust/lib.dart'
-    show AuthHandle, SubscriptionHandle, WebSocketConnectionState;
+    show AuthHandle, ClientError, SubscriptionHandle, WebSocketConnectionState;
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/convex_logger.dart';
@@ -162,8 +163,9 @@ class WebConvexClient implements IConvexClient {
   /// Identity version counter for Authenticate messages (separate from querySetVersion)
   int _identityVersion = 0;
 
-  /// Pending requests waiting for responses (query, mutation, action)
-  final Map<int, Completer<String>> _pendingRequests = {};
+  /// Mutations and actions sent and not yet answered. A dropped socket fails
+  /// the actions at once and the resumed session writes the mutations again.
+  final _pending = WebPendingRequests();
 
   /// Active subscriptions
   final Map<String, _WebSubscription> _subscriptions = {};
@@ -370,6 +372,23 @@ class WebConvexClient implements IConvexClient {
         }
       }
 
+      // Mutations written to the socket that closed and never answered go
+      // again on this socket. The session id is the same, so the server
+      // answers each once: it runs the ones it never saw and deduplicates by
+      // requestId the ones it did. A session reset fails them instead
+      // (_handleFatalError, reconnect), so nothing here runs a mutation twice.
+      final resend = _pending.mutationsToResend();
+      if (resend.isNotEmpty) {
+        config.logger(
+          ConvexLogLevel.info,
+          'web',
+          'Resending ${resend.length} in-flight mutation(s) on the resumed session',
+        );
+        for (final msg in resend) {
+          _sendMessage(msg);
+        }
+      }
+
       // Re-register active subscriptions that survived a reconnect.
       // After a WS drop + reconnect, the server has a fresh session with no
       // subscriptions. The _subscriptions map still holds Dart-side callbacks,
@@ -392,6 +411,22 @@ class WebConvexClient implements IConvexClient {
         'WS closed (code=$code, reason="$reason", wasClean=$wasClean, session=$_sessionId, qsVersion=$_querySetVersion, activeSubs=${_subscriptions.length})',
       );
       _updateConnectionState(WebSocketConnectionState.connecting);
+
+      // An action cannot be replayed, so its caller hears now rather than at
+      // the operation timeout. A sent mutation waits for the resumed session,
+      // which writes it again in onopen.
+      final failed = _pending.failActions(
+        const ClientError.internalError(
+          msg: 'Connection lost while action was in flight',
+        ),
+      );
+      if (failed > 0) {
+        config.logger(
+          ConvexLogLevel.warn,
+          'web',
+          'Failed $failed in-flight action(s) on close; ${_pending.mutationsToResend().length} mutation(s) wait for the reconnect',
+        );
+      }
 
       // Attempt reconnection if not disposed
       if (!_isDisposed) {
@@ -572,7 +607,7 @@ class WebConvexClient implements IConvexClient {
     final requestId = message['requestId'] as int?;
     if (requestId == null) return;
 
-    final completer = _pendingRequests.remove(requestId);
+    final completer = _pending.take(requestId);
     if (completer == null) return;
 
     final success = message['success'] as bool? ?? false;
@@ -589,7 +624,7 @@ class WebConvexClient implements IConvexClient {
     final requestId = message['requestId'] as int?;
     if (requestId == null) return;
 
-    final completer = _pendingRequests.remove(requestId);
+    final completer = _pending.take(requestId);
     if (completer == null) return;
 
     final success = message['success'] as bool? ?? false;
@@ -616,6 +651,13 @@ class WebConvexClient implements IConvexClient {
     // immediately triggers another FatalError (version mismatch).
     _sessionId = null;
     _connectionCount = 0;
+    // A fresh session cannot deduplicate a resent mutation, so nothing in
+    // flight survives this.
+    _pending.failAll(
+      const ClientError.internalError(
+        msg: 'Connection reset while request was in flight',
+      ),
+    );
 
     // Close connection — the onclose handler will trigger _scheduleReconnect,
     // which creates a fresh WS. The new onopen will generate a new sessionId
@@ -743,7 +785,7 @@ class WebConvexClient implements IConvexClient {
       config.logger(
         ConvexLogLevel.error,
         'web',
-        'Max reconnection attempts reached (activeSubs=${_subscriptions.length}, pendingRequests=${_pendingRequests.length})',
+        'Max reconnection attempts reached (activeSubs=${_subscriptions.length}, pendingRequests=${_pending.length})',
       );
       return;
     }
@@ -795,6 +837,7 @@ class WebConvexClient implements IConvexClient {
       config.logger(ConvexLogLevel.debug, 'web', 'SENDING: $messageJson');
     }
     ws.send(messageJson.toJS);
+    _pending.markSent(message);
 
     if (!isPong) {
       config.logger(
@@ -911,8 +954,7 @@ class WebConvexClient implements IConvexClient {
     await _authInFlight?.future;
 
     final requestId = _generateMessageId();
-    final completer = Completer<String>();
-    _pendingRequests[requestId] = completer;
+    final completer = _pending.open(requestId, isAction: false);
 
     try {
       // Send Mutation message (Convex protocol)
@@ -926,12 +968,12 @@ class WebConvexClient implements IConvexClient {
       return await completer.future.timeout(
         config.operationTimeout,
         onTimeout: () {
-          _pendingRequests.remove(requestId);
+          _pending.take(requestId);
           throw TimeoutException('Mutation timeout: $name');
         },
       );
     } catch (e) {
-      _pendingRequests.remove(requestId);
+      _pending.take(requestId);
       rethrow;
     }
   }
@@ -944,8 +986,7 @@ class WebConvexClient implements IConvexClient {
     await _authInFlight?.future;
 
     final requestId = _generateMessageId();
-    final completer = Completer<String>();
-    _pendingRequests[requestId] = completer;
+    final completer = _pending.open(requestId, isAction: true);
 
     try {
       // Send Action message (Convex protocol)
@@ -959,12 +1000,12 @@ class WebConvexClient implements IConvexClient {
       return await completer.future.timeout(
         config.operationTimeout,
         onTimeout: () {
-          _pendingRequests.remove(requestId);
+          _pending.take(requestId);
           throw TimeoutException('Action timeout: $name');
         },
       );
     } catch (e) {
-      _pendingRequests.remove(requestId);
+      _pending.take(requestId);
       rethrow;
     }
   }
@@ -1380,9 +1421,15 @@ class WebConvexClient implements IConvexClient {
 
     // Force a fresh server session: a new deployment (or a clean manual
     // reconnect) must not try to resume the old session's version counters.
+    // Nothing in flight can be resent on it, so each caller hears now.
     _sessionId = null;
     _connectionCount = 0;
     _reconnectAttempts = 0;
+    _pending.failAll(
+      const ClientError.internalError(
+        msg: 'Connection reset while request was in flight',
+      ),
+    );
 
     try {
       await _connect();
@@ -1432,7 +1479,7 @@ class WebConvexClient implements IConvexClient {
     _connectionStateController.close();
 
     // Clear pending requests and subscriptions
-    _pendingRequests.clear();
+    _pending.clear();
     _subscriptions.clear();
 
     config.logger(ConvexLogLevel.debug, 'web', 'Client disposed');
