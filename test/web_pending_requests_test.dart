@@ -64,6 +64,25 @@ void main() {
     expect(pending.length, 0);
   });
 
+  test('a queued request whose caller heard it fail is not flushed', () async {
+    final pending = WebPendingRequests();
+    final action = {'type': 'Action', 'requestId': 1, 'udfPath': 'a:run'};
+    final actionCompleter = pending.open(1, isAction: true);
+    pending.open(2, isAction: false);
+    pending.open(3, isAction: false);
+    final modify = {'type': 'ModifyQuerySet', 'newVersion': 1};
+
+    expect(pending.shouldFlush(action), isTrue);
+    final lost = StateError('connection lost');
+    pending.failActions(lost);
+    await expectLater(actionCompleter.future, throwsA(same(lost)));
+    expect(pending.shouldFlush(action), isFalse);
+    expect(pending.shouldFlush(mutation(2)), isTrue);
+    pending.take(3);
+    expect(pending.shouldFlush(mutation(3)), isFalse);
+    expect(pending.shouldFlush(modify), isTrue);
+  });
+
   test('a message that is not a Mutation is never recorded for resend', () {
     final pending = WebPendingRequests();
     pending.open(1, isAction: true);

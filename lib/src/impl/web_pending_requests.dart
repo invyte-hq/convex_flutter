@@ -68,6 +68,16 @@ class WebPendingRequests {
     return ids.length;
   }
 
+  /// Whether a message still queued for the next socket may be written. A
+  /// Mutation or Action whose caller already heard a failure or a timeout is
+  /// not: writing it would run it after the app was told it did not run.
+  /// Every other message type is the client's own and is flushed.
+  bool shouldFlush(Map<String, dynamic> message) {
+    final type = message['type'];
+    if (type != 'Mutation' && type != 'Action') return true;
+    return _completers.containsKey(message['requestId']);
+  }
+
   /// The Mutation messages to write again on a new socket of the same
   /// session, in the order they were first sent.
   List<Map<String, dynamic>> mutationsToResend() =>

@@ -368,6 +368,14 @@ class WebConvexClient implements IConvexClient {
               }
             }
           }
+          if (!_pending.shouldFlush(msg)) {
+            config.logger(
+              ConvexLogLevel.debug,
+              'web',
+              'Dropping queued ${msg['type']} requestId=${msg['requestId']}: its caller already heard it fail',
+            );
+            continue;
+          }
           _sendMessage(msg);
         }
       }
