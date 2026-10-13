@@ -553,8 +553,11 @@ class WebConvexClient implements IConvexClient {
       final errorData = _extractTransitionErrorData(mod);
 
       if (errorMessage != null) {
+        // The consumer's onError decides what a refusal means (a resource
+        // that went away under a live subscription is routine), so the
+        // transport reports it without raising an alarm of its own.
         config.logger(
-          ConvexLogLevel.warn,
+          ConvexLogLevel.info,
           'web',
           'Subscription error for queryId=$queryId: $errorMessage (data: $errorData)',
         );
