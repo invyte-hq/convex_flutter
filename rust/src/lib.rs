@@ -9,7 +9,10 @@ use std::{
 };
 
 use android_logger::Config;
+use base64::Engine;
 use convex::{
+    AuthTokenFetcher,
+    AuthenticationToken,
     ConvexClient,
     ConvexClientBuilder,
     FunctionResult,
@@ -23,8 +26,8 @@ use futures::{
 };
 use log::{debug, error, LevelFilter};
 use parking_lot::Mutex;
-use base64::Engine;
 use serde::Deserialize;
+use tokio::sync::Notify;
 
 /// Initialise android_logger.  The `tracing` crate is compiled with its
 /// `log` feature, so tracing events from the Convex SDK automatically
@@ -229,7 +232,7 @@ pub struct MobileConvexClient {
     // client at a different deployment via `set_deployment_url`. parking_lot
     // Mutex (already used for `state_change_sender`) — reads are brief clones.
     deployment_url: Mutex<String>, // URL of the Convex deployment
-    client_id: String,           // Client ID for authentication
+    client_id: String,             // Client ID for authentication
     // Swappable inner client so we can force a full reconnect (drop + re-init)
     // on app resume after iOS suspension. tokio::sync::Mutex because init is
     // async (ConvexClientBuilder::build).
@@ -242,7 +245,11 @@ pub struct MobileConvexClient {
 impl MobileConvexClient {
     /// Creates a new MobileConvexClient instance with the given deployment URL and client ID.
     #[frb(sync)]
-    pub fn new(deployment_url: String, client_id: String, verbose_logging: bool) -> MobileConvexClient {
+    pub fn new(
+        deployment_url: String,
+        client_id: String,
+        verbose_logging: bool,
+    ) -> MobileConvexClient {
         init_logging(verbose_logging);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -557,6 +564,15 @@ impl MobileConvexClient {
     /// The `fetch_token` callback is called:
     /// - Immediately to get the initial token
     /// - Automatically when the token is about to expire (60 seconds before expiry)
+    /// - By the Convex SDK on every WebSocket reconnect, through the
+    ///   [`AuthTokenFetcher`] this installs with `set_auth_callback`, so a
+    ///   token that expired while the socket was down is never re-sent.
+    ///
+    /// A static `set_auth(Some(token))` is what this replaced: the SDK replays
+    /// that string on reconnect as it is, the server answers `AuthError`, the
+    /// SDK restarts the protocol and replays it again, and every live query
+    /// runs anonymous on each cycle until this loop's timer gets around to a
+    /// refresh.
     ///
     /// The `on_auth_change` callback is called whenever auth state changes.
     ///
@@ -573,52 +589,54 @@ impl MobileConvexClient {
         let client = self.connected_client().await?;
         let is_auth_clone = is_authenticated.clone();
 
-        let fetch_token = Arc::new(fetch_token);
+        let fetch_token: Arc<DartTokenFetcher> = Arc::new(fetch_token);
         let on_auth_change = Arc::new(on_auth_change);
 
-        // Buffer time before token expiry to trigger refresh (60 seconds)
-        const REFRESH_BUFFER_SECS: u64 = 60;
-        // Minimum refresh interval to prevent tight loops on errors
-        const MIN_REFRESH_INTERVAL_SECS: u64 = 5;
-        // Default refresh interval when JWT can't be decoded (5 minutes)
-        const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
+        // The token the SDK sends, shared with the fetcher the SDK calls on
+        // reconnect. `refreshed` wakes the loop when that fetcher brought a
+        // new one, so the timed refresh follows the new expiry.
+        let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let refreshed = Arc::new(Notify::new());
 
         // Spawn the token refresh loop
         self.rt.spawn(async move {
             let mut cancel_fut = cancel_receiver.fuse();
             let mut was_authenticated = false;
 
-            loop {
+            'refresh: loop {
                 // Fetch token from Dart
-                let fetch_token_clone = fetch_token.clone();
-                let token_future = (fetch_token_clone)();
+                let token_future = (fetch_token)();
 
                 let token_result = select_biased! {
                     _ = cancel_fut => {
                         // Cancelled - clear auth and exit
                         debug!("Auth refresh cancelled");
                         let mut client = client.clone();
-                        let _ = client.set_auth(None).await;
+                        client.set_auth_callback(None).await;
                         if was_authenticated {
                             let on_auth_change_clone = on_auth_change.clone();
                             let future = (on_auth_change_clone)(false);
                             let _ = future.await;
                         }
-                        break;
+                        break 'refresh;
                     }
                     token = token_future.fuse() => token,
                 };
 
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-
                 match token_result {
                     Some(token) => {
-                        // Set the token
+                        // Hand the SDK the fetcher with this token cached, so
+                        // installing it sends one Authenticate with no second
+                        // round trip to Dart.
+                        *latest.lock() = Some(token);
                         let mut client = client.clone();
-                        client.set_auth(Some(token.clone())).await;
+                        client
+                            .set_auth_callback(Some(sdk_token_fetcher(
+                                fetch_token.clone(),
+                                latest.clone(),
+                                refreshed.clone(),
+                            )))
+                            .await;
 
                         // Notify state change if needed
                         if !was_authenticated {
@@ -631,48 +649,45 @@ impl MobileConvexClient {
                             });
                         }
 
-                        // Decode expiry and schedule next refresh
-                        let sleep_duration = if let Some(exp) = decode_jwt_expiry(&token) {
-                            let refresh_at = exp.saturating_sub(REFRESH_BUFFER_SECS);
-                            if refresh_at > now_secs {
-                                Duration::from_secs(refresh_at - now_secs)
-                            } else {
-                                // Token already expired or about to, refresh immediately
-                                Duration::from_secs(MIN_REFRESH_INTERVAL_SECS)
-                            }
-                        } else {
-                            // Can't decode JWT, use default refresh interval
-                            debug!("Could not decode JWT expiry, using default refresh interval");
-                            Duration::from_secs(DEFAULT_REFRESH_INTERVAL_SECS)
-                        };
+                        // Sleep until the refresh time of whatever token the
+                        // SDK holds now, a reconnect's fetch included, or until
+                        // cancellation.
+                        loop {
+                            let sleep_duration = refresh_delay(latest.lock().as_deref());
+                            debug!("Next token refresh in {:?}", sleep_duration);
 
-                        debug!("Next token refresh in {:?}", sleep_duration);
-
-                        // Sleep until refresh time or cancellation
-                        let sleep_fut = tokio::time::sleep(sleep_duration).fuse();
-                        pin_mut!(sleep_fut);
-                        select_biased! {
-                            _ = cancel_fut => {
-                                debug!("Auth refresh cancelled during sleep");
-                                let mut client = client.clone();
-                                let _ = client.set_auth(None).await;
-                                if was_authenticated {
-                                    let on_auth_change_clone = on_auth_change.clone();
-                                    let future = (on_auth_change_clone)(false);
-                                    let _ = future.await;
+                            let sleep_fut = tokio::time::sleep(sleep_duration).fuse();
+                            let refreshed_fut = refreshed.notified().fuse();
+                            pin_mut!(sleep_fut, refreshed_fut);
+                            select_biased! {
+                                _ = cancel_fut => {
+                                    debug!("Auth refresh cancelled during sleep");
+                                    let mut client = client.clone();
+                                    client.set_auth_callback(None).await;
+                                    if was_authenticated {
+                                        let on_auth_change_clone = on_auth_change.clone();
+                                        let future = (on_auth_change_clone)(false);
+                                        let _ = future.await;
+                                    }
+                                    break 'refresh;
                                 }
-                                break;
-                            }
-                            _ = sleep_fut => {
-                                // Time to refresh, continue loop
+                                _ = refreshed_fut => {
+                                    // A reconnect fetched a token: schedule from it.
+                                    continue;
+                                }
+                                _ = sleep_fut => {
+                                    // Time to refresh
+                                    break;
+                                }
                             }
                         }
                     }
                     None => {
                         // No token - clear auth
                         debug!("Token fetcher returned None, clearing auth");
+                        *latest.lock() = None;
                         let mut client = client.clone();
-                        let _ = client.set_auth(None).await;
+                        client.set_auth_callback(None).await;
 
                         if was_authenticated {
                             is_auth_clone.store(false, Ordering::SeqCst);
@@ -684,7 +699,7 @@ impl MobileConvexClient {
                         }
 
                         // Exit the loop when fetch_token returns None
-                        break;
+                        break 'refresh;
                     }
                 }
             }
@@ -693,6 +708,74 @@ impl MobileConvexClient {
         });
 
         Ok(AuthHandle::new(cancel_sender, is_authenticated))
+    }
+}
+
+/// The Dart side of `set_auth_with_refresh`'s `fetch_token`, type-erased so the
+/// SDK fetcher below can hold it.
+type DartTokenFetcher = dyn Fn() -> DartFnFuture<Option<String>> + Send + Sync;
+
+/// The [`AuthTokenFetcher`] handed to the SDK. Installing it asks without
+/// `force_refresh` and gets the token the refresh loop just fetched. A
+/// reconnect asks with it, and that goes to Dart: the socket was down, so the
+/// token may have died meanwhile, and Dart's own cache answers at once while
+/// the token is good and mints when it is not. A token Dart hands back lands in
+/// `latest` and wakes the refresh loop, so its timer follows the new expiry; a
+/// `None` means signed out, and the SDK then reconnects with no auth.
+fn sdk_token_fetcher(
+    fetch_token: Arc<DartTokenFetcher>,
+    latest: Arc<Mutex<Option<String>>>,
+    refreshed: Arc<Notify>,
+) -> AuthTokenFetcher {
+    Box::new(move |force_refresh: bool| {
+        let fetch_token = fetch_token.clone();
+        let latest = latest.clone();
+        let refreshed = refreshed.clone();
+        Box::pin(async move {
+            if !force_refresh {
+                if let Some(token) = latest.lock().clone() {
+                    return Ok(AuthenticationToken::User(token));
+                }
+            }
+            let token = (fetch_token)().await;
+            *latest.lock() = token.clone();
+            refreshed.notify_one();
+            Ok(match token {
+                Some(token) => AuthenticationToken::User(token),
+                None => AuthenticationToken::None,
+            })
+        })
+    })
+}
+
+/// How long the refresh loop sleeps before fetching again: until 60 s before
+/// the token's `exp`, 5 s when that point has passed (so a dying token is
+/// replaced without a tight loop), 5 min when there is no `exp` to read, and
+/// 5 s with no token at all, which the next fetch then settles.
+fn refresh_delay(token: Option<&str>) -> Duration {
+    // Buffer time before token expiry to trigger refresh (60 seconds)
+    const REFRESH_BUFFER_SECS: u64 = 60;
+    // Minimum refresh interval to prevent tight loops on errors
+    const MIN_REFRESH_INTERVAL_SECS: u64 = 5;
+    // Default refresh interval when JWT can't be decoded (5 minutes)
+    const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
+
+    let Some(token) = token else {
+        return Duration::from_secs(MIN_REFRESH_INTERVAL_SECS);
+    };
+    let Some(exp) = decode_jwt_expiry(token) else {
+        debug!("Could not decode JWT expiry, using default refresh interval");
+        return Duration::from_secs(DEFAULT_REFRESH_INTERVAL_SECS);
+    };
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let refresh_at = exp.saturating_sub(REFRESH_BUFFER_SECS);
+    if refresh_at > now_secs {
+        Duration::from_secs(refresh_at - now_secs)
+    } else {
+        Duration::from_secs(MIN_REFRESH_INTERVAL_SECS)
     }
 }
 

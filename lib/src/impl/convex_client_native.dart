@@ -58,12 +58,15 @@ class NativeConvexClient implements IConvexClient {
   /// subscribe; this is the Dart-side belt for the whole orchestration.)
   static const Duration _reconnectTimeout = Duration(seconds: 20);
 
-  /// Backoff + cap for retrying a reconnect that failed or timed out (e.g. the
-  /// network was briefly unavailable right after resume). Bounded so we don't
-  /// spin forever; convex's own ~35s inactivity heartbeat is the ultimate
-  /// backstop if every retry is exhausted.
-  static const Duration _reconnectRetryDelay = Duration(seconds: 3);
-  static const int _maxReconnectRetries = 4;
+  /// Backoff for retrying a reconnect that failed or timed out (the network is
+  /// usually still coming up right after a resume): doubling from the floor to
+  /// the ceiling, and never giving up. Once [reconnect] has dropped the inner
+  /// client there is no SDK socket left to heal on its own: a client that
+  /// stopped retrying sat with no refresh loop and no subscriptions until the
+  /// next background and resume, and every call it made meanwhile went out
+  /// unauthenticated.
+  static const Duration _reconnectRetryFloor = Duration(seconds: 3);
+  static const Duration _reconnectRetryCeiling = Duration(seconds: 30);
 
   /// Active subscriptions, keyed by an internal monotonic id. Tracked so we
   /// can re-fire them after [reconnect] tears down the inner Rust client.
@@ -77,20 +80,22 @@ class NativeConvexClient implements IConvexClient {
   Future<String?> Function()? _lastTokenFetcher;
   void Function(bool)? _lastOnAuthChange;
 
-  /// Tracks an in-flight initial auth setup: set on entry to
-  /// [setAuthWithRefresh] and completed after the Rust SDK pushes the first
-  /// token to the WS (see [_startRefreshLoop]; the FFI call itself returns
-  /// before that), then nulled out. Steady-state calls pay nothing —
-  /// `await null?.future` is a no-op.
+  /// The auth gate: open while a token is on its way to a worker that has
+  /// none yet. Set on entry to [setAuthWithRefresh] and to a [reconnect] that
+  /// replays auth, completed once the Rust loop has queued the first token
+  /// (see [_startRefreshLoop]; the FFI call itself returns before that), then
+  /// nulled out. Steady-state calls pay nothing — `await null?.future` is a
+  /// no-op.
   ///
-  /// During initial auth, [subscribe], [query], [mutation] and [action] await
-  /// this future so the server processes Authenticate before anything they
-  /// send. Without it, calls that race the caller's setAuthWithRefresh land at
-  /// the server unauthenticated and fail with NOT_AUTHENTICATED on
-  /// auth-required functions.
+  /// While it is open, [subscribe], [query], [mutation] and [action] await it
+  /// so the server processes Authenticate before anything they send. Without
+  /// it, calls that race the token land at the server unauthenticated and
+  /// fail with NOT_AUTHENTICATED on auth-required functions. A resume used to
+  /// open no gate, so a screen opening on resume did exactly that for as long
+  /// as the mint took.
   ///
-  /// Only the *first* setAuth roundtrip is gated; subsequent refresh-loop
-  /// rotations (handled inside the Rust SDK) don't toggle this.
+  /// Refresh-loop rotations on a live worker don't toggle this: the worker
+  /// already carries a token.
   Completer<void>? _authInFlight;
 
   /// Single-flight guard: only one reconnect body runs at a time (resumed fires
@@ -111,9 +116,10 @@ class NativeConvexClient implements IConvexClient {
   /// handles.
   int _reconnectGeneration = 0;
 
-  /// Bounded retry for a reconnect that failed/timed out (network not yet up).
+  /// The retry of a reconnect that failed or timed out, and the delay the
+  /// next one gets. The delay resets on success and on a fresh resume.
   Timer? _reconnectRetryTimer;
-  int _reconnectRetryCount = 0;
+  Duration _reconnectRetryDelay = _reconnectRetryFloor;
 
   /// True once a real background (`paused`) occurred since the last `resumed`.
   /// This — not wall-clock activity timing — is the signal that the OS may have
@@ -298,28 +304,47 @@ class NativeConvexClient implements IConvexClient {
     );
     _activeSubs[id] = tracked;
 
+    // The FFI call parks until the socket flushes, so a reconnect can run
+    // while it is out. The sub is tracked already, so that reconnect replays
+    // it on the new client, and whatever this call then brings back belongs
+    // to the dropped client and is let go. A cancel meanwhile is honoured the
+    // same way.
+    final gen = _reconnectGeneration;
     try {
-      tracked.currentHandle = await _rustClient.subscribe(
+      final handle = await _rustClient.subscribe(
         name: name,
         args: formattedArgs,
         onUpdate: (value) => _dispatchOnUpdate(tracked, value),
         onError: (message, value) => _dispatchOnError(tracked, message, value),
       );
+      if (tracked.canceled || gen != _reconnectGeneration) {
+        try {
+          handle.cancel();
+        } catch (_) {}
+      } else {
+        tracked.currentHandle = handle;
+      }
     } catch (e, st) {
-      // A throw while the socket is down is stranded for the next `connected`
-      // to replay, as a reconnect's is. One while connected is final: replaying
-      // a sub that can never succeed would force reconnect after reconnect.
-      if (_currentConnectionState == WebSocketConnectionState.connected) {
+      if (tracked.canceled || gen != _reconnectGeneration) {
+        // Nothing to report: the replay owns the sub, or nobody wants it.
+      } else if (_currentConnectionState ==
+          WebSocketConnectionState.connected) {
+        // A throw while the socket is down is stranded for the next
+        // `connected` to replay, as a reconnect's is. One while connected is
+        // final: replaying a sub that can never succeed would force reconnect
+        // after reconnect.
         _activeSubs.remove(id);
         rethrow;
+      } else {
+        tracked.needsRestore = true;
+        config.logger(
+          ConvexLogLevel.error,
+          'native',
+          'Subscribe "$name" failed; stranded until the socket connects: '
+              '$e\n$st',
+        );
+        _dispatchOnError(tracked, e.toString(), null);
       }
-      tracked.needsRestore = true;
-      config.logger(
-        ConvexLogLevel.error,
-        'native',
-        'Subscribe "$name" failed; stranded until the socket connects: $e\n$st',
-      );
-      _dispatchOnError(tracked, e.toString(), null);
     }
 
     return _NativeSubscriptionHandle(onCancel: () => _cancelTracked(id));
@@ -596,12 +621,19 @@ class NativeConvexClient implements IConvexClient {
       return reconnect(url: next);
     }
 
-    // Otherwise settle the retry budget: clear it on success, or schedule a
-    // bounded retry if the attempt failed/timed out (network still settling).
+    // Otherwise settle the retry: clear it on success, or schedule the next
+    // one if the attempt failed or timed out (the network is still settling).
     if (result) {
-      _reconnectRetryCount = 0;
+      _reconnectRetryDelay = _reconnectRetryFloor;
       _reconnectRetryTimer?.cancel();
     } else {
+      // The attempt tore its subscriptions down before it could re-fire them,
+      // or is still parked on one. Mark them, so a socket that comes up before
+      // the timer re-fires them too, through
+      // [_restoreOrphanedSubscriptionsIfAny].
+      for (final sub in _activeSubs.values) {
+        if (sub.currentHandle == null) sub.needsRestore = true;
+      }
       _scheduleReconnectRetry();
     }
     return result;
@@ -626,52 +658,73 @@ class NativeConvexClient implements IConvexClient {
     final authFetcher = _lastTokenFetcher;
     final authOnChange = _lastOnAuthChange;
 
-    // 1) Tear down the existing Rust subscription tasks. Their cancel sender
-    //    flips the spawned task into clean exit; the user's callback refs are
-    //    dropped on the Rust side.
-    for (final sub in subsToReplay) {
-      try {
-        sub.currentHandle?.cancel();
-      } catch (_) {}
-      sub.currentHandle = null;
-    }
-
-    // 2) Drop the auth refresh loop — it holds a clone of the Convex client and
-    //    would keep poking the dead instance otherwise.
-    _currentAuthHandle?.dispose();
-    _currentAuthHandle = null;
-
-    // 3) Rebuild the transport. With a url, repoint at the new deployment;
-    //    otherwise drop the inner client so the next op builds a fresh socket
-    //    against the current deployment. Both leave the client null so the auth
-    //    step lazily rebuilds it.
-    if (url != null) {
-      await _rustClient.setDeploymentUrl(url: url);
-    } else {
-      await _rustClient.forceReconnect();
-    }
-    if (gen != _reconnectGeneration) return false;
-
-    // 4) Replay auth BEFORE re-subscribing. [_startRefreshLoop] returns once
-    //    the loop's first token is on the worker's FIFO, so every re-Subscribe
-    //    below queues behind that Authenticate: one fetch, one Authenticate,
-    //    no NOT_AUTHENTICATED flash. Skip entirely if the consumer never used
-    //    refresh-based auth (they own their setAuth). A throw from the FFI
-    //    lands in [reconnect]'s catch, which fails the attempt and schedules
-    //    the bounded retry.
-    if (authFetcher != null) {
-      final handle = await _startRefreshLoop(
-        tokenFetcher: authFetcher,
-        onAuthChange: (isAuth) {
-          authOnChange?.call(isAuth);
-          _emitAuthState(isAuth);
-        },
-      );
-      if (gen != _reconnectGeneration) {
-        handle.dispose();
-        return false;
+    // Hold every call issued from here until the replayed Authenticate is on
+    // the new worker's FIFO: the gate [setAuthWithRefresh] holds at boot.
+    // Without it a mutation, a one-shot or a subscribe racing the replay
+    // lands on the fresh socket ahead of any token and is refused as
+    // unauthenticated. A gate a timed-out attempt left open is reused, so
+    // its waiters move on to this attempt. Only the live attempt releases it
+    // (a superseded one would let waiters out before the newer attempt's
+    // token is queued); a live attempt that failed releases it too, and the
+    // retry opens it again.
+    final gate = authFetcher == null
+        ? null
+        : (_authInFlight ??= Completer<void>());
+    try {
+      // 1) Tear down the existing Rust subscription tasks. Their cancel sender
+      //    flips the spawned task into clean exit; the user's callback refs
+      //    are dropped on the Rust side.
+      for (final sub in subsToReplay) {
+        try {
+          sub.currentHandle?.cancel();
+        } catch (_) {}
+        sub.currentHandle = null;
       }
-      _currentAuthHandle = handle;
+
+      // 2) Drop the auth refresh loop — it holds a clone of the Convex client
+      //    and would keep poking the dead instance otherwise.
+      _currentAuthHandle?.dispose();
+      _currentAuthHandle = null;
+
+      // 3) Rebuild the transport. With a url, repoint at the new deployment;
+      //    otherwise drop the inner client so the next op builds a fresh
+      //    socket against the current deployment. Both leave the client null
+      //    so the auth step lazily rebuilds it.
+      if (url != null) {
+        await _rustClient.setDeploymentUrl(url: url);
+      } else {
+        await _rustClient.forceReconnect();
+      }
+      if (gen != _reconnectGeneration) return false;
+
+      // 4) Replay auth BEFORE re-subscribing. [_startRefreshLoop] returns once
+      //    the loop's first token is on the worker's FIFO, so every
+      //    re-Subscribe below queues behind that Authenticate: one fetch, one
+      //    Authenticate, no NOT_AUTHENTICATED flash. Skip entirely if the
+      //    consumer never used refresh-based auth (they own their setAuth). A
+      //    throw from the FFI lands in [reconnect]'s catch, which fails the
+      //    attempt and schedules the retry.
+      if (authFetcher != null) {
+        final handle = await _startRefreshLoop(
+          tokenFetcher: authFetcher,
+          onAuthChange: (isAuth) {
+            authOnChange?.call(isAuth);
+            _emitAuthState(isAuth);
+          },
+        );
+        if (gen != _reconnectGeneration) {
+          handle.dispose();
+          return false;
+        }
+        _currentAuthHandle = handle;
+      }
+    } finally {
+      if (gate != null &&
+          gen == _reconnectGeneration &&
+          identical(_authInFlight, gate)) {
+        gate.complete();
+        _authInFlight = null;
+      }
     }
 
     // 5) Re-fire every still-tracked subscription. A failure here marks the sub
@@ -713,29 +766,25 @@ class NativeConvexClient implements IConvexClient {
     return allOk;
   }
 
-  /// Schedules a bounded, delayed retry after a failed/timed-out reconnect (the
-  /// network may still be coming up right after resume). Capped by
-  /// [_maxReconnectRetries]; convex's own inactivity heartbeat is the backstop
-  /// once retries are exhausted.
+  /// Schedules the next retry after a failed or timed-out reconnect (the
+  /// network may still be coming up right after resume), doubling the delay
+  /// from [_reconnectRetryFloor] to [_reconnectRetryCeiling]. It never stops:
+  /// the single-flight guard keeps retries from piling up, and a success or a
+  /// fresh resume resets the delay.
   void _scheduleReconnectRetry() {
     if (_disposed) return;
-    if (_reconnectRetryCount >= _maxReconnectRetries) {
-      config.logger(
-        ConvexLogLevel.warn,
-        'native',
-        'Reconnect retries exhausted ($_maxReconnectRetries); '
-            'relying on SDK heartbeat to recover',
-      );
-      return;
-    }
-    _reconnectRetryCount++;
+    final delay = _reconnectRetryDelay;
+    final doubled = delay * 2;
+    _reconnectRetryDelay = doubled > _reconnectRetryCeiling
+        ? _reconnectRetryCeiling
+        : doubled;
     _reconnectRetryTimer?.cancel();
-    _reconnectRetryTimer = Timer(_reconnectRetryDelay, () {
+    _reconnectRetryTimer = Timer(delay, () {
       if (_disposed) return;
       config.logger(
         ConvexLogLevel.debug,
         'native',
-        'Retrying reconnect (attempt $_reconnectRetryCount/$_maxReconnectRetries)',
+        'Retrying reconnect after ${delay.inSeconds}s',
       );
       unawaited(reconnect());
     });
@@ -779,8 +828,8 @@ class NativeConvexClient implements IConvexClient {
       return;
     }
     _didBackgroundSinceResume = false;
-    // Fresh user-driven foregrounding: reset the retry budget.
-    _reconnectRetryCount = 0;
+    // Fresh user-driven foregrounding: start the backoff over.
+    _reconnectRetryDelay = _reconnectRetryFloor;
     // Fire-and-forget; reconnect() is single-flight + self-healing internally.
     unawaited(reconnect());
   }
@@ -803,6 +852,10 @@ class NativeConvexClient implements IConvexClient {
     // instead of writing to _currentAuthHandle / the closed controllers below.
     _reconnectGeneration++;
     _reconnectRetryTimer?.cancel();
+    // Release anyone waiting on the auth gate; the client is gone either way.
+    final gate = _authInFlight;
+    _authInFlight = null;
+    if (gate != null && !gate.isCompleted) gate.complete();
     for (final sub in _activeSubs.values) {
       sub.canceled = true;
       try {
