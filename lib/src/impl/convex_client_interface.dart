@@ -95,7 +95,9 @@ abstract class IConvexClient {
   /// [tokenFetcher] is called whenever a token is needed:
   ///   - immediately, to obtain the initial token,
   ///   - again, ~60 seconds before the current JWT's `exp` claim,
-  ///   - and again on `AuthError` from the server.
+  ///   - on native, again on every WebSocket reconnect, so a token that
+  ///     expired while the socket was down is never re-sent,
+  ///   - on web, again on `AuthError` from the server.
   ///
   /// The caller's [tokenFetcher] is expected to be idempotent / cache-friendly
   /// (e.g. Clerk's `sessionToken()` returns a cached JWT until it expires) —
@@ -110,7 +112,8 @@ abstract class IConvexClient {
   /// the first `Authenticate` was sent or queued, on native after the Rust
   /// refresh loop's first `set_auth`. Until then [subscribe], [query],
   /// [mutation] and [action] wait, so nothing the caller sends afterwards
-  /// can overtake that `Authenticate`. A [tokenFetcher] that yields `null`
+  /// can overtake that `Authenticate`; on native they wait the same way while
+  /// a reconnect replays auth. A [tokenFetcher] that yields `null`
   /// releases them at once, unauthenticated. [tokenFetcher] should return
   /// `null` rather than throw when no token can be minted; a throw is logged
   /// and counts as no token for that pass.

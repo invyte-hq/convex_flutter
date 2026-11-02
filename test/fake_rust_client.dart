@@ -19,6 +19,17 @@ class FakeRustClient implements MobileConvexClient {
   /// it, the way the bridge throws when the socket is down.
   Object? subscribeError;
 
+  /// When set, [subscribe] records its call and then parks on this until the
+  /// test completes it, the way the bridge parks until the socket flushes.
+  Completer<void>? parkSubscribe;
+
+  /// When set, [forceReconnect] records its call and then throws it.
+  Object? forceReconnectError;
+
+  /// Every handle [subscribe] handed out, oldest first, so a test can see
+  /// which one the client cancelled.
+  final handles = <FakeSubscriptionHandle>[];
+
   /// The listener the client registered through [onWebsocketStateChange], so a
   /// test can drive the socket state.
   FutureOr<void> Function(WebSocketConnectionState)? onStateChange;
@@ -92,14 +103,20 @@ class FakeRustClient implements MobileConvexClient {
   }) async {
     calls.add('subscribe:$name');
     lastOnUpdate = onUpdate;
+    final park = parkSubscribe;
+    if (park != null) await park.future;
     final error = subscribeError;
     if (error != null) throw error;
-    return FakeSubscriptionHandle();
+    final handle = FakeSubscriptionHandle(name);
+    handles.add(handle);
+    return handle;
   }
 
   @override
   Future<void> forceReconnect() async {
     calls.add('force_reconnect');
+    final error = forceReconnectError;
+    if (error != null) throw error;
   }
 
   @override
@@ -133,8 +150,13 @@ class FakeAuthHandle implements AuthHandle {
 }
 
 class FakeSubscriptionHandle implements SubscriptionHandle {
+  FakeSubscriptionHandle([this.name = '']);
+
+  final String name;
+  bool cancelled = false;
+
   @override
-  void cancel() {}
+  void cancel() => cancelled = true;
 
   @override
   void dispose() {}

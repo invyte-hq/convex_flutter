@@ -98,6 +98,30 @@ subscribe self-cleans: the worker still builds the `QuerySubscription` and its
 `Drop` sends `Unsubscribe`, so no half-registered query leaks (and the whole
 client is dropped on the next reconnect regardless).
 
+### A real token fetcher on the SDK: a reconnect re-mints
+
+**lib.rs** — `set_auth_with_refresh` installs an `AuthTokenFetcher` through the
+SDK's `set_auth_callback` instead of pushing a static string with
+`set_auth(Some(token))`. The SDK calls that fetcher with `force_refresh=true` on
+every WebSocket reconnect (`LocalSyncState::restart`), and the fetcher then asks
+Dart, whose Clerk cache answers at once while the token is good and mints when
+it is not. Installing it asks without force and gets the token the loop just
+fetched, so the install sends one `Authenticate` with no second round trip.
+
+Why: with a static token the SDK replays the same string on reconnect. When it
+expired while the socket was down, which is every return from the iOS background
+after an hour, the server answers `AuthError`, the SDK restarts the protocol and
+replays it again, and every live query runs anonymous on each cycle until this
+loop's timer gets around to a refresh; on iOS that timer runs on a monotonic
+clock the device's sleep does not advance. The SDK's own docs say to prefer
+`set_auth_callback` for exactly this.
+
+The timer-based refresh stays. It re-installs the fetcher with the new token,
+and a token a reconnect fetched lands in the shared slot and wakes the loop
+(`tokio::sync::Notify`), so the next refresh follows the new expiry. The FFI
+surface is unchanged, so no bridge codegen; the crate hash moves, so the
+Precompile workflow must publish before the app's `ref` does.
+
 ### Mutable deployment URL + `set_deployment_url` (in-app deployment switcher)
 
 **lib.rs** — `MobileConvexClient::deployment_url` changed from `String` to
@@ -158,7 +182,8 @@ Future<AuthHandle> setAuthWithRefresh({
 
 - `tokenFetcher` is called immediately for the initial token, then on a
   schedule driven by the JWT's `exp` claim (~60s before expiry), and again
-  on server-side `AuthError`. The caller is expected to handle their own
+  on every WebSocket reconnect on native (through the SDK fetcher above) or
+  on server-side `AuthError` on web. The caller is expected to handle their own
   token caching (e.g. Clerk's `sessionToken()` returns a cached JWT) and
   to observe individual rotations inside `tokenFetcher` itself.
 - `onAuthChange` fires **only on transitions** (unauthenticated ↔ authenticated)
@@ -289,9 +314,24 @@ The rewrite:
   flash, matching the web transport's `onopen` ordering. (It used to push a
   token via `setAuth` first and then start the loop, which fetched and sent
   a second one.)
-- **Self-healing.** A failed/timed-out attempt schedules a bounded retry, and a
-  subscription stranded by a transient outage (`needsRestore`) is restored when
-  the socket next reaches `connected`.
+- **Gated replay.** The replay opens the same `_authInFlight` gate that
+  `setAuthWithRefresh` opens at boot, from before the old client is dropped
+  until the replayed loop has queued its first token, so a `query`, `mutation`,
+  `action` or new `subscribe` issued meanwhile waits for that `Authenticate`
+  instead of landing on the fresh socket ahead of it. Before this, a chat
+  screen opening on resume registered its queries and fired `markAsRead`
+  anonymous for as long as the Clerk mint took (seconds on a waking radio),
+  the server refused them all with `NOT_AUTHENTICATED`, and the app, which
+  drops that error while signed in, showed stale data. A gate a timed-out
+  attempt left open is reused by the retry, and only the live attempt
+  releases it. A `subscribe` parked across the reconnect lets go of whatever
+  the dropped client gives back; the replay owns it.
+- **Self-healing, without a budget.** A failed or timed-out attempt marks the
+  subscriptions it tore down (`needsRestore`), so a socket that reaches
+  `connected` re-fires them, and schedules a retry that backs off from 3s to
+  30s and never stops. The old four-try budget then "relied on the SDK
+  heartbeat", but the inner client had been dropped, so nothing healed: no
+  refresh loop, no subscriptions, until the next background and resume.
 
 ### `reconnect({String? url})` — in-app deployment switcher (W5)
 
